@@ -40,3 +40,5 @@ pandas>=2.2
 
 # Utilities
 python-slugify>=8.0
+
+cloudinary==1.41.0
