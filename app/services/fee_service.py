@@ -62,8 +62,10 @@ def create_fee_assignment(assign_data: FeeAssignmentCreate, db: Session):
     db.commit()
 
 def _generate_invoice_number() -> str:
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    return f"INV-{timestamp}-{str(uuid.uuid4())[:4].upper()}"
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f") 
+    random_part = str(uuid.uuid4())[:8].upper()
+    return f"INV-{timestamp}-{random_part}"
 
 def parse_date(date_string: str) -> date:
     """Parse date string to date object"""
