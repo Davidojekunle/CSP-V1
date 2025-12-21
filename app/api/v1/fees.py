@@ -9,6 +9,9 @@ from app.core.database import get_session
 from app.core.auth import get_current_admin
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeResponse, FeeAssignmentCreate, InvoiceGenerateRequest, PaginatedInvoiceResponse, InvoiceResponse
 from app.services import fee_service, activity_log_service
+from app.schemas.dashboard import FeeDashboardStats # We will create this schema
+from fastapi.responses import StreamingResponse
+from app.services.pdf.invoice import invoice_pdf_service
 
 router = APIRouter(
     prefix="/fees/admin", # PRESERVED: Matches original prefix="/fees" + "/admin"
@@ -121,3 +124,27 @@ async def get_all_invoices(
 async def cancel_invoice(invoice_id: str, db: Session = Depends(get_session)):
     fee_service.cancel_invoice(invoice_id, db)
     return {"message": "Invoice cancelled successfully"}
+
+
+@router.get("/dashboard-stats", response_model=FeeDashboardStats)
+async def get_dashboard_stats(
+    session_id: Optional[str] = Query(None),
+    term_id: Optional[str] = Query(None),
+    db: Session = Depends(get_session)
+):
+    # We will create this service function next
+    stats = fee_service.get_dashboard_stats(db, session_id, term_id)
+    return stats
+
+# PRESERVED: GET /fees/admin/invoice/{id}/pdf
+@router.get("/invoice/{invoice_id}/pdf")
+async def admin_download_invoice_pdf(
+    invoice_id: str,
+    db: Session = Depends(get_session)
+):
+    pdf_buffer = invoice_pdf_service.generate_invoice_pdf(invoice_id, db)
+    filename = f"invoice_{invoice_id}.pdf"
+    return StreamingResponse(
+        pdf_buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )

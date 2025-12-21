@@ -71,3 +71,14 @@ class SessionEnrollmentStats(BaseModel):
     session_name: str
     total_students: int
     active_students: int
+
+# In app/schemas/dashboard.py
+class FeeDashboardStats(BaseModel):
+    total_invoices: int
+    total_invoiced: float
+    total_paid: float
+    total_outstanding: float
+    collection_rate: float
+    status_breakdown: Dict[str, int]
+    payment_methods: Dict[str, int]
+    recent_payments: int

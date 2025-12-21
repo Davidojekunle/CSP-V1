@@ -2,6 +2,12 @@ from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
 from typing import List, Dict
 from pydantic import EmailStr
 
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import tempfile
+import os
+
 from app.core.config import settings
 
 # Email configuration - PRESERVED from original
@@ -136,56 +142,68 @@ async def send_result_notification_email(
 async def send_payment_receipt_email(
     recipient_email: EmailStr,
     student_name: str,
-    receipt_details: Dict,
-    pdf_attachment: bytes
+    receipt_details: dict,
+    pdf_attachment_bytes: bytes
 ):
     """
-    Sends a payment receipt email with invoice PDF attached.
+    Sends an email with a payment receipt and the invoice PDF attached,
+    using a temporary file to comply with fastapi-mail's attachment requirements.
     """
     if not settings.EMAIL_ENABLED:
         print(f"Email sending disabled. Would send receipt to {recipient_email}.")
         return
 
-    html = f"""
-    
-        
-            Payment Receipt - Crowners Portal
-            Dear {student_name},
-            Thank you for your payment. Your payment has been successfully processed.
-            
-            Payment Details:
-            
-                Invoice Number: {receipt_details.get('invoice_number')}
-                Amount Paid: ₦{receipt_details.get('amount_paid_this_time'):,.2f}
-                Total Invoice Amount: ₦{receipt_details.get('total_amount'):,.2f}
-                Total Paid: ₦{receipt_details.get('paid_amount'):,.2f}
-                Balance Due: ₦{receipt_details.get('balance_due'):,.2f}
-            
-            
-            Please find your invoice attached to this email.
-            Thank you!
-        
-    
+    html_body = f"""
+    <html><body>
+        <h2>Dear {student_name},</h2>
+        <p>Thank you for your payment. Your payment has been successfully processed.</p>
+        <h3>Payment Summary:</h3>
+        <ul>
+            <li><strong>Invoice Number:</strong> {receipt_details.get('invoice_number', 'N/A')}</li>
+            <li><strong>Amount Paid:</strong> NGN {receipt_details.get('amount_paid_this_time', 0):,}</li>
+            <li><strong>Total Paid on Invoice:</strong> NGN {receipt_details.get('paid_amount', 0):,}</li>
+            <li><strong>Remaining Balance:</strong> NGN {receipt_details.get('balance_due', 0):,}</li>
+        </ul>
+        <p>Your updated invoice is attached for your records.</p>
+        <p>Thank you!</p>
+    </body></html>
     """
-    
-    message = MessageSchema(
-        subject=f"Payment Receipt - Invoice {receipt_details.get('invoice_number')}",
-        recipients=[recipient_email],
-        body=html,
-        subtype=MessageType.html,
-        attachments=[{
-            "file": pdf_attachment,
-            "filename": f"invoice_{receipt_details.get('invoice_number')}.pdf",
-            "content_type": "application/pdf"
-        }]
-    )
 
-    fm = FastMail(conf)
+    attachment_filename = f"Invoice_{receipt_details.get('invoice_number', 'receipt')}.pdf"
+
+    # --- THIS IS THE GUARANTEED FIX ---
+    # 1. Use a temporary file to write the PDF bytes to disk.
+    #    `delete=False` is crucial so the file is not deleted when the 'with' block exits.
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(pdf_attachment_bytes)
+        temp_file_path = tmp_file.name # Get the full path to the temporary file
+
     try:
-        await fm.send_message(message)
-        print(f"Payment receipt sent to {recipient_email}")
+        # 2. Construct the MessageSchema with the file path.
+        message = MessageSchema(
+            subject=f"Payment Receipt for Invoice {receipt_details.get('invoice_number', 'N/A')}",
+            recipients=[recipient_email],
+            body=html_body,
+            subtype=MessageType.html,
+            attachments=[temp_file_path]  # <-- Pass the file path string in a list
+        )
+        
+        fm = FastMail(conf)
+        # 3. Send the message. fastapi-mail will read the file from the path.
+        await fm.send_message(message=message)
+        print(f"Payment receipt with PDF sent to {recipient_email}")
+
     except Exception as e:
-        print(f"Failed to send payment receipt to {recipient_email}: {e}")
+        print(f"Failed to send receipt email to {recipient_email}. Error: {e}")
+        
+    finally:
+        # 4. CRITICAL: Clean up the temporary file after sending is attempted.
+        #    This runs whether the email succeeded or failed.
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+
 
 
 # Create a singleton instance for easy importing
@@ -204,3 +222,4 @@ class EmailService:
 
 
 email_service = EmailService()
+

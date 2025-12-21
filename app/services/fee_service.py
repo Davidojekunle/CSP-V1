@@ -2,10 +2,11 @@
 """Service layer for Fee and Fee Assignment management."""
 from sqlmodel import Session, select, and_
 from fastapi import HTTPException
-from typing import List, Optional
+from typing import Counter, List, Optional
 from sqlalchemy import func, or_
 
 from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, Fee, TargetType, InvoiceStatus, Payment, UserRole
+from app.models.base import PaymentStatus
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeAssignmentCreate
 from datetime import date, datetime
 import uuid
@@ -232,3 +233,37 @@ def cancel_invoice(invoice_id: str, db: Session) -> Invoice:
     db.commit()
     db.refresh(invoice)
     return invoice
+
+# In app/services/fee_service.py
+def get_dashboard_stats(db: Session, session_id: Optional[str], term_id: Optional[str]) -> dict:
+    # This is a direct migration of your original logic
+    invoice_query = select(Invoice)
+    if session_id: invoice_query = invoice_query.where(Invoice.session_id == session_id)
+    if term_id: invoice_query = invoice_query.where(Invoice.term_id == term_id)
+    
+    all_invoices = db.exec(invoice_query).all()
+    
+    # Financial calculations should exclude cancelled/draft
+    financially_relevant = [inv for inv in all_invoices if inv.status not in [InvoiceStatus.cancelled, InvoiceStatus.draft]]
+    
+    total_invoiced = sum(inv.total_amount for inv in financially_relevant)
+    total_outstanding = sum(inv.balance_due for inv in financially_relevant)
+    
+    # Payment queries
+    payment_query = select(Payment).where(Payment.status == PaymentStatus.successful)
+    if financially_relevant:
+        payment_query = payment_query.where(Payment.invoice_id.in_([inv.id for inv in financially_relevant]))
+    
+    successful_payments = db.exec(payment_query).all()
+    total_paid = sum(p.amount for p in successful_payments)
+
+    status_counts = Counter(inv.status.value for inv in all_invoices)
+    payment_methods = Counter(p.payment_method.value for p in successful_payments if p.payment_method)
+    
+    return {
+        "total_invoices": len(all_invoices), "total_invoiced": total_invoiced,
+        "total_paid": total_paid, "total_outstanding": total_outstanding,
+        "collection_rate": round((total_paid / total_invoiced * 100) if total_invoiced > 0 else 0, 2),
+        "status_breakdown": dict(status_counts), "payment_methods": dict(payment_methods),
+        "recent_payments": sum(1 for p in successful_payments if p.paid_at and (datetime.utcnow() - p.paid_at).days <= 7)
+    }

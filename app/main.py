@@ -24,6 +24,7 @@ from app.api.v1 import enrollments as enrollment_router
 from app.api.v1 import activity_logs as activity_logs_router
 from app.api.v1 import results as results_router
 from app.api.v1 import fees as fees_router
+from app.api.v1 import payments as payments_router
 # Create FastAPI app
 app = FastAPI(
     title="School Management System API",
@@ -50,6 +51,7 @@ app.include_router(enrollment_router.router)
 app.include_router(activity_logs_router.router)
 app.include_router(results_router.router)
 app.include_router(fees_router.router)
+app.include_router(payments_router.router)
 # app.include_router(admin_routes)
 # app.include_router(academic_routes)
 # app.include_router(enrollment_routes)
