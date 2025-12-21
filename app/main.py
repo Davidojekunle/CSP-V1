@@ -65,8 +65,8 @@ app.include_router(fees_router.router)
 @app.on_event("startup")
 def on_startup():
     """Initialize database and create sample data"""
-    create_db_and_tables()
-#     create_sample_data()
+    # create_db_and_tables()
+    create_sample_data()
 
 
 def create_sample_data():
