@@ -54,7 +54,10 @@ if all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_FROM, MAIL_SERVER]):
 
 # FIXED FUNCTION: Now accepts first_name as a string
 async def send_password_reset_email(email: List[EmailStr], first_name: str, token: str):
-    """Send password reset email"""
+    if conf is None:
+        # Mail not configured — silently skip
+        return
+
     reset_link = f"http://yourappfrontend.com/reset-password?token={token}"
     html = f"""
     <p>Hello {first_name},</p>
@@ -62,6 +65,7 @@ async def send_password_reset_email(email: List[EmailStr], first_name: str, toke
     <p><a href="{reset_link}">{reset_link}</a></p>
     <p>This link will expire in 1 hour.</p>
     """
+
     message = MessageSchema(
         subject="Password Reset Request",
         recipients=email,
@@ -71,6 +75,7 @@ async def send_password_reset_email(email: List[EmailStr], first_name: str, toke
 
     fm = FastMail(conf)
     await fm.send_message(message)
+
 
 
 def get_password_hash(password):

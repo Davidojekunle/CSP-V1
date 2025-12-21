@@ -11,9 +11,11 @@ asyncpg>=0.29
 aiosqlite>=0.19
 
 # Authentication
-python-jose[cryptography]>=3.3
-passlib[bcrypt]>=1.7.4
-python-dotenv>=1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-dotenv==1.0.0
+
 
 # Validation
 pydantic>=2.5
