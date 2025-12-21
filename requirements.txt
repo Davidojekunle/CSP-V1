@@ -24,6 +24,8 @@ email-validator>=2.1
 
 # HTTP / Payments
 httpx>=0.26
+requests==2.31.0
+
 
 # PDF Generation
 reportlab>=4.0
