@@ -4,7 +4,7 @@ Database connection and session management.
 PRESERVED: SQLite support with UUID handling and foreign key enforcement.
 ADDED: PostgreSQL support for future migration.
 """
-from sqlmodel import create_engine, SQLModel, Session
+from sqlmodel import create_engine, SQLModel, Session, inspect
 from sqlalchemy import event, text
 from uuid import UUID
 import sqlite3
@@ -45,12 +45,13 @@ setup_sqlite_uuid_support(engine)
 
 
 def create_db_and_tables():
-    """
-    Create all database tables.
-    PRESERVED: Exact same functionality as original.
-    """
+    inspector = inspect(engine)
+    if "users" in inspector.get_table_names():
+        print("⚠️ Tables already exist, skipping create_all")
+        return
+
     SQLModel.metadata.create_all(engine)
-    print("✅ All tables created successfully!")
+    print("✅ Tables created")
 
 
 def drop_db():
