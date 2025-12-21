@@ -29,17 +29,28 @@ pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
 
 # Email configuration
-conf = ConnectionConfig(
-    MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
-    MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
-    MAIL_FROM=os.getenv("MAIL_FROM"),
-    MAIL_PORT=int(os.getenv("MAIL_PORT", 587)),
-    MAIL_SERVER=os.getenv("MAIL_SERVER"),
-    MAIL_STARTTLS=os.getenv("MAIL_STARTTLS", "True").lower() in ("true", "1", "t"),
-    MAIL_SSL_TLS=os.getenv("MAIL_SSL_TLS", "False").lower() in ("true", "1", "t"),
-    USE_CREDENTIALS=True,
-    VALIDATE_CERTS=True
-)
+MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+MAIL_FROM = os.getenv("MAIL_FROM")
+MAIL_SERVER = os.getenv("MAIL_SERVER")
+MAIL_PORT = int(os.getenv("MAIL_PORT", 587))
+MAIL_STARTTLS = os.getenv("MAIL_STARTTLS", "true").lower() in ("true", "1", "t")
+MAIL_SSL_TLS = os.getenv("MAIL_SSL_TLS", "false").lower() in ("true", "1", "t")
+
+conf = None
+
+if all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_FROM, MAIL_SERVER]):
+    conf = ConnectionConfig(
+        MAIL_USERNAME=MAIL_USERNAME,
+        MAIL_PASSWORD=MAIL_PASSWORD,
+        MAIL_FROM=MAIL_FROM,
+        MAIL_PORT=MAIL_PORT,
+        MAIL_SERVER=MAIL_SERVER,
+        MAIL_STARTTLS=MAIL_STARTTLS,
+        MAIL_SSL_TLS=MAIL_SSL_TLS,
+        USE_CREDENTIALS=True,
+        VALIDATE_CERTS=True
+    )
 
 # FIXED FUNCTION: Now accepts first_name as a string
 async def send_password_reset_email(email: List[EmailStr], first_name: str, token: str):
