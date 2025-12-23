@@ -6,6 +6,7 @@ Replaces scattered os.getenv() calls throughout the codebase.
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional, List
 from functools import lru_cache
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -48,6 +49,15 @@ class Settings(BaseSettings):
     CORS_CREDENTIALS: bool = True
     CORS_METHODS: List[str] = ["*"]
     CORS_HEADERS: List[str] = ["*"]
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            if v.strip() == "*":
+                return ["*"]
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
     
     # Email Configuration (FastAPI-Mail)
     MAIL_USERNAME: Optional[str] = None
