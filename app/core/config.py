@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = [
         "http://localhost:5173",
         "http://172.20.10.3:5173",
-        "https://school-dashboard-pink.vercel.app/"
+        "https://school-dashboard-pink.vercel.app"
     ]
     CORS_CREDENTIALS: bool = True
     CORS_METHODS: List[str] = ["*"]
