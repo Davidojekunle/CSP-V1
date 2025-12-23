@@ -34,7 +34,7 @@ app = FastAPI(
 # This fixes the "No 'Access-Control-Allow-Origin' header" error
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,  # Now properly parsed as List[str]
+    allow_origins=settings.get_cors_origins(),  # Parse comma-separated string to list
     allow_credentials=settings.CORS_CREDENTIALS,
     allow_methods=settings.CORS_METHODS,
     allow_headers=settings.CORS_HEADERS,
@@ -209,7 +209,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("🚀 Starting School Management System API...")
-    print(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
+    print(f"🌐 CORS Origins: {settings.get_cors_origins()}")  # Use method
     print("📖 API Documentation: http://localhost:8000/docs")
     print("🔗 Interactive API: http://localhost:8000/redoc")
     
