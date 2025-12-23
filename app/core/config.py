@@ -1,8 +1,10 @@
 # app/core/config.py
-
+"""
+Centralized configuration management.
+Replaces scattered os.getenv() calls throughout the codebase.
+"""
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
-from typing import Optional, List, Union
+from typing import Optional, List
 from functools import lru_cache
 
 
@@ -37,8 +39,12 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 60 * 24 = 1 day (matches original)
     
-    # CORS Settings - Store as string, will be parsed to list
-    CORS_ORIGINS: str = "http://localhost:5173,http://172.20.10.3:5173,https://school-dashboard-pink.vercel.app"
+    # CORS Settings
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:5173",
+        "http://172.20.10.3:5173",
+        "https://school-dashboard-pink.vercel.app"
+    ]
     CORS_CREDENTIALS: bool = True
     CORS_METHODS: List[str] = ["*"]
     CORS_HEADERS: List[str] = ["*"]
@@ -53,10 +59,12 @@ class Settings(BaseSettings):
     MAIL_SSL_TLS: bool = False
     EMAIL_ENABLED: bool = False
     
+    # File Upload & Storage
     # Cloudinary Integration (for image uploads)
     CLOUDINARY_CLOUD_NAME: Optional[str] = None
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
+
     
     # PDF Generation
     PDF_TEMPLATE_DIR: str = "templates/pdf"
@@ -80,22 +88,6 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore"
     )
-    
-    def get_cors_origins(self) -> List[str]:
-        """
-        Parse CORS origins from comma-separated string.
-        This method is called by main.py to get the list of origins.
-        """
-        if not self.CORS_ORIGINS:
-            return []
-        
-        # Handle wildcard
-        if self.CORS_ORIGINS.strip() == "*":
-            return ["*"]
-        
-        # Split by comma and clean up whitespace
-        origins = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
-        return origins
     
     def get_database_url(self) -> str:
         """Get database URL."""
