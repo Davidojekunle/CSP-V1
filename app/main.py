@@ -8,10 +8,7 @@ from app.models import Class, Subject, AcademicSession, Term
 from datetime import date
 from sqlmodel import Session, select
 
-# Import routes (will be created in Phase 3)
-# from app.api.v1 import auth, admin, students, etc.
-
-# For now, import old routes to maintain compatibility
+# Import routes
 import sys
 sys.path.append('..')  # Temporary - to import old routes
 
@@ -25,6 +22,7 @@ from app.api.v1 import activity_logs as activity_logs_router
 from app.api.v1 import results as results_router
 from app.api.v1 import fees as fees_router
 from app.api.v1 import payments as payments_router
+
 # Create FastAPI app
 app = FastAPI(
     title="School Management System API",
@@ -32,16 +30,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware - PRESERVED: Same origins as original
+# Add CORS middleware - MUST be added before routes
+# This fixes the "No 'Access-Control-Allow-Origin' header" error
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.CORS_ORIGINS,  # Now properly parsed as List[str]
     allow_credentials=settings.CORS_CREDENTIALS,
     allow_methods=settings.CORS_METHODS,
     allow_headers=settings.CORS_HEADERS,
+    expose_headers=["*"],  # Allow frontend to access all response headers
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
-# # Include routes - PRESERVED: Same prefixes and tags
+# Include routes - Same prefixes and tags as original
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 app.include_router(users_router, prefix="/admin", tags=["User Management"])
 app.include_router(bulk_uploads_router)
@@ -52,16 +53,6 @@ app.include_router(activity_logs_router.router)
 app.include_router(results_router.router)
 app.include_router(fees_router.router)
 app.include_router(payments_router.router)
-# app.include_router(admin_routes)
-# app.include_router(academic_routes)
-# app.include_router(enrollment_routes)
-# app.include_router(results_routes)
-# app.include_router(fee_routes)
-# app.include_router(dashboard_routes)
-# app.include_router(staff_routes)
-# app.include_router(traits_routes)
-
-
 
 
 @app.on_event("startup")
@@ -197,7 +188,7 @@ def create_sample_data():
         print("   Student: student@school.com / student123")
 
 
-# Root endpoint - PRESERVED
+# Root endpoint
 @app.get("/")
 async def root():
     return {
@@ -208,7 +199,7 @@ async def root():
     }
 
 
-# Health check endpoint - PRESERVED
+# Health check endpoint
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": "2024-01-01"}
@@ -218,6 +209,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("🚀 Starting School Management System API...")
+    print(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
     print("📖 API Documentation: http://localhost:8000/docs")
     print("🔗 Interactive API: http://localhost:8000/redoc")
     

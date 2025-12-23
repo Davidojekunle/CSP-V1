@@ -1,10 +1,8 @@
 # app/core/config.py
-"""
-Centralized configuration management.
-Replaces scattered os.getenv() calls throughout the codebase.
-"""
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional, List
+from pydantic import field_validator
+from typing import Optional, List, Union
 from functools import lru_cache
 
 
@@ -39,8 +37,8 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 60 * 24 = 1 day (matches original)
     
-    # CORS Settings
-    CORS_ORIGINS: List[str] = [
+    # CORS Settings - accepts both string (comma-separated) and list
+    CORS_ORIGINS: Union[str, List[str]] = [
         "http://localhost:5173",
         "http://172.20.10.3:5173",
         "https://school-dashboard-pink.vercel.app"
@@ -59,12 +57,10 @@ class Settings(BaseSettings):
     MAIL_SSL_TLS: bool = False
     EMAIL_ENABLED: bool = False
     
-    # File Upload & Storage
     # Cloudinary Integration (for image uploads)
     CLOUDINARY_CLOUD_NAME: Optional[str] = None
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
-
     
     # PDF Generation
     PDF_TEMPLATE_DIR: str = "templates/pdf"
@@ -88,6 +84,21 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore"
     )
+    
+    @field_validator('CORS_ORIGINS', mode='before')
+    @classmethod
+    def parse_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        """
+        Parse CORS origins from string or list.
+        Handles comma-separated strings from environment variables.
+        """
+        if isinstance(v, str):
+            # Handle wildcard
+            if v.strip() == "*":
+                return ["*"]
+            # Split by comma and clean up whitespace
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
     
     def get_database_url(self) -> str:
         """Get database URL."""
