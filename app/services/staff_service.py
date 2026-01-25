@@ -1,6 +1,12 @@
 from sqlmodel import Session, select, func, and_
 from fastapi import HTTPException
 from typing import List, Dict, Any, Optional
+from app.schemas.staff import StaffStudentResponse, StaffResultResponse, BehavioralTraitsCreate, FormClassOverviewResponse, BehavioralTraitsResponse
+from collections import defaultdict
+from app.models import FormTeacherRemark, BehavioralTraits, InvoiceStatus, Invoice
+from app.services.pdf.report_card import report_card_service
+from fastapi.responses import Response
+
 
 from app.models import (
     User, UserRole, AcademicSession, Term, Class, Subject, ClassSubject, Enrollment, Result, StaffProfile, StudentProfile
@@ -157,3 +163,225 @@ def update_staff_profile(staff_user: User, profile_data: dict, db: Session) -> S
     db.commit()
     db.refresh(profile)
     return profile
+
+def get_students_for_my_class(staff_user: User, class_id: str, db: Session) -> List[dict]:
+    """
+    Fetches students for a class, but only if the staff member is assigned to teach
+    at least one subject in that class.
+    """
+    # 1. Authorization: Verify the teacher is assigned to this class.
+    assignment = db.exec(select(ClassSubject).where(
+        ClassSubject.class_id == class_id,
+        ClassSubject.teacher_id == staff_user.id
+    )).first()
+    if not assignment:
+        raise HTTPException(status_code=403, detail="You are not assigned to teach in this class.")
+
+    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+    if not current_session: raise HTTPException(status_code=400, detail="No current academic session set.")
+
+    # 2. PERFORMANCE: Fetch all enrolled students and their results status in bulk.
+    enrolled_students_query = select(User, StudentProfile, Enrollment).join(StudentProfile).join(Enrollment).where(
+        Enrollment.class_id == class_id,
+        Enrollment.session_id == current_session.id,
+        Enrollment.is_active == True
+    ).order_by(User.last_name, User.first_name)
+    enrolled_students = db.exec(enrolled_students_query).all()
+
+    student_ids = [user.id for user, _, __ in enrolled_students]
+    if not student_ids: return []
+
+    # Check which students have a result for the teacher's specific subject in this class
+    results_for_subject_query = select(Result.student_id).where(
+        Result.student_id.in_(student_ids),
+        Result.class_id == class_id,
+        Result.subject_id == assignment.subject_id, # Check against the first found assignment
+        Result.session_id == current_session.id
+    )
+    students_with_results = set(db.exec(results_for_subject_query).all())
+    
+    # 3. Assemble response
+    response_list = []
+    for user, profile, enrollment in enrolled_students:
+        response_list.append({
+            "id": user.id,
+            "name": f"{user.first_name} {user.last_name}",
+            "admission_number": profile.admission_number,
+            "enrollment_status": enrollment.is_active,
+            "has_results": user.id in students_with_results
+        })
+    return response_list
+
+
+def get_results_for_my_class_subject(staff_user: User, class_id: str, subject_id: str, db: Session) -> List[dict]:
+    """
+    Fetches the marksheet for a specific class and subject, but only if the
+    staff member is assigned to teach it.
+    """
+    # 1. Authorization: Verify this specific assignment.
+    assignment = db.exec(select(ClassSubject).where(
+        ClassSubject.class_id == class_id,
+        ClassSubject.subject_id == subject_id,
+        ClassSubject.teacher_id == staff_user.id
+    )).first()
+    if not assignment:
+        raise HTTPException(status_code=403, detail="You are not assigned to teach this subject in this class.")
+
+    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+    current_term = db.exec(select(Term).where(Term.is_current == True)).first()
+    if not current_session or not current_term:
+        raise HTTPException(status_code=400, detail="No current academic session or term set.")
+
+    # 2. Get all enrolled students for the class
+    enrolled_students = db.exec(select(User, StudentProfile).join(StudentProfile).join(Enrollment).where(
+        Enrollment.class_id == class_id,
+        Enrollment.session_id == current_session.id,
+        Enrollment.is_active == True
+    )).all()
+    
+    if not enrolled_students: return []
+    student_ids = [user.id for user, _ in enrolled_students]
+
+    # 3. Get all existing results for this context in one query
+    results_map = {res.student_id: res for res in db.exec(select(Result).where(
+        Result.student_id.in_(student_ids),
+        Result.class_id == class_id,
+        Result.subject_id == subject_id,
+        Result.session_id == current_session.id,
+        Result.term_id == current_term.id
+    )).all()}
+
+    # 4. Assemble the response marksheet
+    marksheet = []
+    for user, profile in enrolled_students:
+        result = results_map.get(user.id)
+        marksheet.append({
+            "id": result.id if result else None,
+            "student_id": user.id,
+            "student_name": f"{user.first_name} {user.last_name}",
+            "student_admission_number": profile.admission_number,
+            "ca1": result.ca1 if result else None,
+            "ca2": result.ca2 if result else None,
+            "exam": result.exam if result else None,
+            "total": result.total if result else None,
+            "grade_letter": result.grade_letter if result else None,
+            "remark": result.remark if result else None,
+        })
+    return marksheet
+def _get_form_class_for_teacher(staff_user: User, db: Session) -> Class:
+    """Helper to find and authorize the form teacher's class."""
+    form_class = db.exec(select(Class).where(Class.form_teacher_id == staff_user.id)).first()
+    if not form_class:
+        raise HTTPException(status_code=403, detail="You are not assigned as a Form Teacher to any class.")
+    return form_class
+
+def get_form_class_overview(staff_user: User, db: Session) -> dict:
+    """
+    PERFORMANCE: Gathers a comprehensive overview for a Form Teacher's class
+    using a minimal number of bulk queries.
+    """
+    form_class = _get_form_class_for_teacher(staff_user, db)
+    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+    current_term = db.exec(select(Term).where(Term.is_current == True)).first()
+    if not current_session or not current_term:
+        raise HTTPException(status_code=400, detail="No current academic session or term is set.")
+
+    # 1. Get all enrolled students in the form class
+    enrolled_students = db.exec(select(User, StudentProfile).join(StudentProfile).join(Enrollment).where(
+        Enrollment.class_id == form_class.id,
+        Enrollment.session_id == current_session.id,
+        Enrollment.is_active == True
+    )).all()
+    if not enrolled_students:
+        return {
+            "class_id": form_class.id, "class_name": form_class.name,
+            "session_name": current_session.name, "term_name": current_term.name.value,
+            "students": []
+        }
+    
+    student_ids = [user.id for user, _ in enrolled_students]
+
+    # 2. Bulk fetch all related data (results, invoices, remarks)
+    all_results = db.exec(select(Result).where(Result.student_id.in_(student_ids), Result.session_id == current_session.id, Result.term_id == current_term.id)).all()
+    pending_invoices = db.exec(select(Invoice.student_id, func.sum(Invoice.balance_due).label("total_due"), func.count(Invoice.id).label("invoice_count")).where(
+        Invoice.student_id.in_(student_ids), Invoice.status.in_([InvoiceStatus.issued, InvoiceStatus.partial, InvoiceStatus.overdue])
+    ).group_by(Invoice.student_id)).all()
+    all_remarks = db.exec(select(FormTeacherRemark).where(
+        FormTeacherRemark.student_id.in_(student_ids), FormTeacherRemark.session_id == current_session.id, FormTeacherRemark.term_id == current_term.id
+    )).all()
+
+    # 3. Process into efficient lookup maps
+    academic_map = defaultdict(lambda: {"total_score": 0.0, "subjects_taken": 0})
+    for r in all_results:
+        if r.total is not None:
+            academic_map[r.student_id]["total_score"] += r.total
+            academic_map[r.student_id]["subjects_taken"] += 1
+    
+    financial_map = {row.student_id: {"balance": row.total_due, "count": row.invoice_count} for row in pending_invoices}
+    remarks_map = {remark.student_id: remark.remark_text for remark in all_remarks}
+
+    # 4. Assemble final response in memory
+    student_summaries = []
+    for user, profile in enrolled_students:
+        acad_data = academic_map[user.id]
+        fin_data = financial_map.get(user.id, {"balance": 0.0, "count": 0})
+        
+        student_summaries.append({
+            "student_id": user.id, "full_name": f"{user.first_name} {user.last_name}",
+            "admission_number": profile.admission_number, "profile_picture_url": user.profile_picture_url,
+            "overall_average": round(acad_data["total_score"] / acad_data["subjects_taken"], 2) if acad_data["subjects_taken"] > 0 else None,
+            "subjects_taken": acad_data["subjects_taken"],
+            "outstanding_balance": float(fin_data["balance"]),
+            "pending_invoices_count": fin_data["count"],
+            "form_teacher_remark": remarks_map.get(user.id)
+        })
+
+    return {
+        "class_id": form_class.id, "class_name": form_class.name,
+        "session_name": current_session.name, "term_name": current_term.name.value,
+        "students": student_summaries
+    }
+
+
+def create_or_update_behavioral_traits(staff_user: User, traits_data: BehavioralTraitsCreate, db: Session) -> BehavioralTraits:
+    form_class = _get_form_class_for_teacher(staff_user, db)
+    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+    current_term = db.exec(select(Term).where(Term.is_current == True)).first()
+    if not current_session or not current_term:
+        raise HTTPException(status_code=400, detail="No current academic session or term set.")
+
+    # Authorization: Check if student is in the form teacher's class
+    enrollment = db.exec(select(Enrollment).where(
+        Enrollment.student_id == traits_data.student_id,
+        Enrollment.class_id == form_class.id,
+        Enrollment.session_id == current_session.id,
+        Enrollment.is_active == True
+    )).first()
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="This student is not in your form class for the current session.")
+
+    existing = db.exec(select(BehavioralTraits).where(
+        BehavioralTraits.student_id == traits_data.student_id,
+        BehavioralTraits.session_id == current_session.id,
+        BehavioralTraits.term_id == current_term.id
+    )).first()
+    
+    if existing:
+        update_dict = traits_data.model_dump(exclude_unset=True, exclude={'student_id'})
+        for key, value in update_dict.items():
+            setattr(existing, key, value)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        new_traits = BehavioralTraits(
+            **traits_data.model_dump(),
+            session_id=current_session.id,
+            term_id=current_term.id
+        )
+        db.add(new_traits)
+        db.commit()
+        db.refresh(new_traits)
+        return new_traits   
+    
