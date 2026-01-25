@@ -2,7 +2,7 @@
 """Service layer for Fee and Fee Assignment management."""
 from sqlmodel import Session, select, and_
 from fastapi import HTTPException
-from typing import Counter, List, Optional
+from typing import Counter, Dict, List, Optional
 from sqlalchemy import func, or_
 
 from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, Fee, TargetType, InvoiceStatus, Payment, UserRole
@@ -266,4 +266,56 @@ def get_dashboard_stats(db: Session, session_id: Optional[str], term_id: Optiona
         "collection_rate": round((total_paid / total_invoiced * 100) if total_invoiced > 0 else 0, 2),
         "status_breakdown": dict(status_counts), "payment_methods": dict(payment_methods),
         "recent_payments": sum(1 for p in successful_payments if p.paid_at and (datetime.utcnow() - p.paid_at).days <= 7)
+    }
+
+def get_fee_assignments_by_target(session_id: str, term_id: str, target_type: Optional[TargetType], db: Session) -> Dict:
+    """
+    Fetches fee assignments for a given term and groups them by their target type.
+    """
+    query = select(FeeAssignment).where(
+        FeeAssignment.session_id == session_id,
+        FeeAssignment.term_id == term_id
+    )
+    if target_type:
+        query = query.where(FeeAssignment.target_type == target_type)
+    
+    assignments = db.exec(query).all()
+
+    # PERFORMANCE: Fetch all related objects (fees, classes, users) in bulk
+    fee_ids = {a.fee_id for a in assignments}
+    class_ids = {a.target_id for a in assignments if a.target_type == TargetType.class_}
+    student_ids = {a.target_id for a in assignments if a.target_type == TargetType.student}
+
+    fees_map = {f.id: f for f in db.exec(select(Fee).where(Fee.id.in_(fee_ids))).all()} if fee_ids else {}
+    classes_map = {c.id: c for c in db.exec(select(Class).where(Class.id.in_(class_ids))).all()} if class_ids else {}
+    students_map = {u.id: u for u in db.exec(select(User).where(User.id.in_(student_ids))).all()} if student_ids else {}
+
+    # Group the results in memory (fast)
+    grouped = {"school": [], "classes": [], "students": []}
+    
+    for assign in assignments:
+        fee = fees_map.get(assign.fee_id)
+        assign_data = {
+            "assignment_id": assign.id,
+            "fee_name": fee.name if fee else "Unknown Fee",
+            "fee_amount": fee.amount if fee else 0.0,
+            "target_id": assign.target_id
+        }
+        
+        if assign.target_type == TargetType.school:
+            grouped["school"].append(assign_data)
+        elif assign.target_type == TargetType.class_:
+            class_obj = classes_map.get(assign.target_id)
+            assign_data["target_name"] = class_obj.name if class_obj else "Unknown Class"
+            grouped["classes"].append(assign_data)
+        elif assign.target_type == TargetType.student:
+            student = students_map.get(assign.target_id)
+            assign_data["target_name"] = f"{student.first_name} {student.last_name}" if student else "Unknown Student"
+            grouped["students"].append(assign_data)
+            
+    return {
+        "session_id": session_id,
+        "term_id": term_id,
+        "assignments_by_target": grouped,
+        "total_assignments": len(assignments)
     }

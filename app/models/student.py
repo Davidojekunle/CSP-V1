@@ -22,7 +22,7 @@ class StudentProfile(SQLModel, table=True):
     blood_group: Optional[str] = None
     allergies: Optional[str] = None
     medical_notes: Optional[str] = None
-    enrollment_date: date
+    enrollment_date: date = Field(default_factory=date.today)
     status: StudentStatus = Field(default=StudentStatus.active, nullable=False)
     graduated_at: Optional[datetime] = None
     

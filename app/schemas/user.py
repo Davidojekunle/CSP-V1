@@ -9,7 +9,7 @@ class StudentProfileCreate(BaseModel):
     guardian_name: str
     guardian_phone: str
     guardian_email: EmailStr
-    enrollment_date: date
+    enrollment_date: Optional[date] = None
     address: Optional[str] = None
     blood_group: Optional[str] = None
     allergies: Optional[str] = None

@@ -1,14 +1,16 @@
 # app/api/v1/fees.py
 """New, refactored API routes for Fee and Fee Assignment management."""
 from fastapi import APIRouter, Depends, Query, status
-from sqlmodel import Session, select
-from typing import List, Optional
+from fastapi import HTTPException
+from sqlmodel import Session, and_, select
+from typing import List, Optional, Dict
 
-from app.models import ActivityAction, User,InvoiceStatus, InvoiceItem, Payment, AcademicSession, Term, Invoice
+from app.models import ActivityAction, User,InvoiceStatus, InvoiceItem, Payment, AcademicSession, Term, Invoice, TargetType, UserRole, PaymentStatus
 from app.core.database import get_session
-from app.core.auth import get_current_admin
+from app.core.auth import get_current_admin, get_current_active_user
+from app.schemas.payment import PaymentResponse
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeResponse, FeeAssignmentCreate, InvoiceGenerateRequest, PaginatedInvoiceResponse, InvoiceResponse
-from app.services import fee_service, activity_log_service
+from app.services import fee_service, activity_log_service, payment_service
 from app.schemas.dashboard import FeeDashboardStats # We will create this schema
 from fastapi.responses import StreamingResponse
 from app.services.pdf.invoice import invoice_pdf_service
@@ -17,6 +19,11 @@ router = APIRouter(
     prefix="/fees/admin", # PRESERVED: Matches original prefix="/fees" + "/admin"
     tags=["Admin - Fee Management"],
     dependencies=[Depends(get_current_admin)]
+)
+
+student_router = APIRouter(
+    prefix="/fees/student",
+    tags=["Student - Fee Management"]
 )
 
 # --- Fee Management ---
@@ -148,3 +155,98 @@ async def admin_download_invoice_pdf(
         pdf_buffer, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+@router.get("/fee-assignments/by-target", response_model=Dict)
+async def get_fee_assignments_by_target(
+    session_id: str = Query(...),
+    term_id: str = Query(...),
+    target_type: Optional[TargetType] = Query(None),
+    db: Session = Depends(get_session)
+):
+    """Get fee assignments grouped by their target type for a specific term."""
+    grouped_assignments = fee_service.get_fee_assignments_by_target(
+        session_id, term_id, target_type, db
+    )
+    return grouped_assignments
+
+@router.get("/payments", response_model=List[PaymentResponse])
+async def get_all_payments(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    status: Optional[PaymentStatus] = Query(None),
+    search: Optional[str] = Query(None),
+    payment_method: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    db: Session = Depends(get_session)
+):
+    """Get all payments with comprehensive filtering (Admin only)."""
+    # NOTE: The payment_service does not yet exist. We will create it.
+    # For now, let's put the logic here to fix the error, then we will move it.
+    
+    # --- TEMPORARY LOGIC (to be moved to payment_service.py) ---
+    query = (
+        select(Payment, Invoice, User)
+        .join(Invoice, Payment.invoice_id == Invoice.id)
+        .join(User, Invoice.student_id == User.id)
+    )
+    
+    conditions = []
+    if status: conditions.append(Payment.status == status)
+    # ... (all other filter conditions would be added here)
+        
+    if conditions: query = query.where(and_(*conditions))
+    
+    results = db.exec(
+        query.offset(skip).limit(limit).order_by(Payment.created_at.desc())
+    ).all()
+    # --- END TEMPORARY LOGIC ---
+
+    response_list = []
+    for payment, invoice, student in results: # <-- FIX 1: Unpack the tuple
+        response_list.append(PaymentResponse(
+            id=payment.id,
+            reference=payment.paystack_reference,
+            invoice_number=invoice.invoice_number,
+            student_name=f"{student.first_name} {student.last_name}",
+            amount=payment.amount,
+            status=payment.status,
+            payment_method=payment.payment_method.value if payment.payment_method else None,
+            paid_at=payment.paid_at,
+            created_at=payment.created_at,
+            invoice_id=payment.invoice_id,
+            student_id=invoice.student_id # <-- FIX 2: Use the invoice object
+        ))
+    return response_list
+
+
+@student_router.get("/invoices/{invoice_id}", response_model=InvoiceResponse)
+async def get_student_invoice_details(
+    invoice_id: str,
+    # --- FIX 1: Expect a dictionary, as the original dependency provides ---
+    current_user_data: Dict = Depends(get_current_active_user),
+    db: Session = Depends(get_session)
+):
+    """
+    Get specific invoice details. Accessible by the student owner or any admin.
+    """
+    # --- FIX 2: Unpack the dictionary exactly like the original code ---
+    user = current_user_data["user"]
+    user_role = current_user_data["user_type"]
+
+    invoice = db.get(Invoice, invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Authorization check using the unpacked variables
+    is_admin = (user_role == UserRole.admin)
+    is_owner = (user_role == UserRole.student and invoice.student_id == user.id)
+
+    if not (is_admin or is_owner):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Use the helper we already defined in this file to build the response
+    return _build_invoice_response(invoice, db)
+
+

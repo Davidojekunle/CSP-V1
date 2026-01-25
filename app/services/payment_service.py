@@ -1,8 +1,9 @@
 # app/services/payment_service.py
 """High-level service for payment logic, including manual and webhook processing."""
 import json
-from typing import Dict
+from typing import Dict, Optional, List
 from sqlmodel import Session, select
+from sqlalchemy import or_, and_, func
 from fastapi import HTTPException
 from datetime import datetime
 
@@ -13,6 +14,11 @@ from app.services.email.sender import send_payment_receipt_email # Assuming this
 from app.services.pdf.invoice import invoice_pdf_service
 # Import your PDF service to attach receipts
 # from app.services.pdf.invoice import invoice_pdf_service
+
+def _parse_date(date_string: str):
+    """Helper function to parse a date string into a datetime object."""
+    return datetime.strptime(date_string, "%Y-%m-%d").date()
+
 
 def _update_payment_and_invoice(payment: Payment, verified_data: Dict, db: Session):
     """
@@ -130,3 +136,57 @@ def _update_invoice_status_from_payment(invoice: Invoice, amount_paid: float, db
     else:
         invoice.status = InvoiceStatus.partial
     db.add(invoice)
+
+
+def get_all_payments(
+    db: Session,
+    skip: int,
+    limit: int,
+    status: Optional[PaymentStatus],
+    search: Optional[str],
+    payment_method: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str]
+) -> List[Payment]:
+    """
+    PERFORMANCE: Fetches a list of all payments with comprehensive filtering
+    using a single, efficient JOIN query.
+    """
+    query = (
+        select(Payment)
+        .join(Invoice, Payment.invoice_id == Invoice.id)
+        .join(User, Invoice.student_id == User.id)
+    )
+    
+    conditions = []
+    
+    if status: conditions.append(Payment.status == status)
+    if payment_method: conditions.append(Payment.payment_method == payment_method)
+    
+    if search:
+        term = f"%{search.strip()}%"
+        conditions.append(or_(
+            Payment.paystack_reference.ilike(term),
+            Invoice.invoice_number.ilike(term),
+            User.first_name.ilike(term),
+            User.last_name.ilike(term),
+            (User.first_name + ' ' + User.last_name).ilike(term)
+        ))
+
+    if date_from:
+        from_date = _parse_date(date_from) # Reuse our helper
+        conditions.append(func.date(Payment.created_at) >= from_date)
+    
+    if date_to:
+        to_date = _parse_date(date_to)
+        conditions.append(func.date(Payment.created_at) <= to_date)
+        
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    
+    results = db.exec(
+        query.offset(skip).limit(limit).order_by(Payment.created_at.desc())
+    ).all()
+    
+    return results

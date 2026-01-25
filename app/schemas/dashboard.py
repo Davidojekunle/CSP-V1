@@ -1,8 +1,17 @@
 # app/schemas/dashboard.py
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import List, Optional, Dict
+from typing import Any
 
-# From admin.py
+
+class CurrentSessionInfo(BaseModel):
+    id: str
+    name: str
+
+class CurrentTermInfo(BaseModel):
+    id: str
+    name: str
+    
 class FeeCollectionOverviewResponse(BaseModel):
     paid_amount: float
     pending_amount: float
@@ -82,3 +91,35 @@ class FeeDashboardStats(BaseModel):
     status_breakdown: Dict[str, int]
     payment_methods: Dict[str, int]
     recent_payments: int
+
+
+class FinancialSummary(BaseModel):
+    current_bill: float
+    pending_payments: int
+
+class StaffClassResponse(BaseModel):
+    id: str 
+    name: str
+    level: str
+    arm: str
+    subject_id: str 
+    subject_name: str
+    subject_code: str
+    students_count: int
+    results_entered: int
+    results_pending: int
+
+class StudentDashboardResponse(BaseModel):
+    user_info: StudentInfo # This now uses the specific model
+    current_enrollment: Optional[Dict[str, Any]]
+    results_summary: ResultsSummary
+    financial_summary: FinancialSummary
+    available_reports: List[Dict[str, Any]]
+
+class StaffDashboardResponse(BaseModel):
+    user_info: Dict[str, Any]
+    assigned_classes: List[StaffClassResponse]
+    results_summary: Dict[str, Any]
+    current_session: CurrentSessionInfo
+    current_term: CurrentTermInfo
+    recent_activities: List[Dict[str, Any]]

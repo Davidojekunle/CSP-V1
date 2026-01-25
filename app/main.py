@@ -21,10 +21,12 @@ from app.api.v1.bulk_upload import router as bulk_uploads_router
 from app.api.v1 import dashboard as dashboard_router
 from app.api.v1 import academic as academic_router
 from app.api.v1 import enrollments as enrollment_router
-from app.api.v1 import activity_logs as activity_logs_router
+from app.api.v1 import activity_logs as activity_logs_router  
 from app.api.v1 import results as results_router
-from app.api.v1 import fees as fees_router
+from app.api.v1.fees import router as admin_fees_router, student_router as student_fees_router
 from app.api.v1 import payments as payments_router
+from app.api.v1.staff import router as staff_routes
+
 # Create FastAPI app
 app = FastAPI(
     title="School Management System API",
@@ -50,8 +52,10 @@ app.include_router(academic_router.router)
 app.include_router(enrollment_router.router)
 app.include_router(activity_logs_router.router)
 app.include_router(results_router.router)
-app.include_router(fees_router.router)
+app.include_router(admin_fees_router)
+app.include_router(student_fees_router)
 app.include_router(payments_router.router)
+app.include_router(staff_routes)
 # app.include_router(admin_routes)
 # app.include_router(academic_routes)
 # app.include_router(enrollment_routes)
