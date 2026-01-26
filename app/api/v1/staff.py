@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 from typing import List
 
 from app.core.database import get_session
-from app.core.auth import get_current_staff # Ensure this dependency exists
+from app.core.auth import get_current_staff
 from app.models import User, AcademicSession, Term
 from app.schemas.staff import  StaffProfileUpdate, StaffStudentResponse, StaffResultResponse, FormClassOverviewResponse, BehavioralTraitsCreate, BehavioralTraitsResponse # Add other schemas
 from app.schemas.dashboard import StudentDashboardResponse, StaffClassResponse, StaffDashboardStatsResponse, StaffDashboardResponse
@@ -104,7 +104,6 @@ async def download_my_form_class_report_cards(
     return Response(content=zip_content, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
-# --- CREATE A NEW ROUTER FOR BEHAVIORAL TRAITS ---
 traits_router = APIRouter(
     prefix="/behavioral-traits",
     tags=["Behavioral Traits"],

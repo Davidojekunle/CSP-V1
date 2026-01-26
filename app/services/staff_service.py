@@ -1,7 +1,8 @@
+import datetime
 from sqlmodel import Session, select, func, and_
 from fastapi import HTTPException
 from typing import List, Dict, Any, Optional
-from app.schemas.staff import StaffStudentResponse, StaffResultResponse, BehavioralTraitsCreate, FormClassOverviewResponse, BehavioralTraitsResponse
+from app.schemas.staff import   BehavioralTraitsCreate, FormClassOverviewResponse, BehavioralTraitsResponse, BulkFormTeacherRemarkCreate
 from collections import defaultdict
 from app.models import FormTeacherRemark, BehavioralTraits, InvoiceStatus, Invoice
 from app.services.pdf.report_card import report_card_service
@@ -385,3 +386,48 @@ def create_or_update_behavioral_traits(staff_user: User, traits_data: Behavioral
         db.refresh(new_traits)
         return new_traits   
     
+def bulk_create_or_update_form_teacher_remarks(staff_user: User, bulk_data: BulkFormTeacherRemarkCreate, db: Session) -> int:
+    """
+    PERFORMANCE: Creates or updates remarks for multiple students in a class at once,
+    using bulk fetching to optimize DB calls.
+    """
+    # 1. Authorization: Verify the staff member is the form teacher of this class
+    student_class = db.get(Class, bulk_data.class_id)
+    if not student_class or student_class.form_teacher_id != staff_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden: You are not the form teacher for this class.")
+
+    # 2. Bulk fetch all existing remarks for these students in one query
+    student_ids = [item.student_id for item in bulk_data.remarks]
+    existing_remarks = db.exec(select(FormTeacherRemark).where(
+        FormTeacherRemark.student_id.in_(student_ids),
+        FormTeacherRemark.session_id == bulk_data.session_id,
+        FormTeacherRemark.term_id == bulk_data.term_id
+    )).all()
+    existing_remarks_map = {remark.student_id: remark for remark in existing_remarks}
+
+    # 3. Process each remark (Update or Create)
+    processed_count = 0
+    for item in bulk_data.remarks:
+        remark = existing_remarks_map.get(item.student_id)
+        
+        if remark:
+            # Update existing
+            remark.remark_text = item.remark.value
+            remark.teacher_id = staff_user.id
+            remark.updated_at = datetime.utcnow()
+        else:
+            # Create new
+            remark = FormTeacherRemark(
+                student_id=item.student_id,
+                class_id=bulk_data.class_id,
+                session_id=bulk_data.session_id,
+                term_id=bulk_data.term_id,
+                teacher_id=staff_user.id,
+                remark_text=item.remark.value
+            )
+        
+        db.add(remark)
+        processed_count += 1
+
+    db.commit()
+    return processed_count

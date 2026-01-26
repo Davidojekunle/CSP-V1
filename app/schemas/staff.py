@@ -2,7 +2,7 @@
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import date
-from app.models import TraitGrade
+from app.models import TraitGrade, FormTeacherRemarkOptions
 
 class GuardianInfo(BaseModel):
     name: Optional[str] = None
@@ -115,5 +115,16 @@ class FormClassOverviewResponse(BaseModel):
     session_name: str
     term_name: str
     students: List[FormClassStudentSummary]
+
+
+class BulkFormTeacherRemarkItem(BaseModel):
+    student_id: str
+    remark: FormTeacherRemarkOptions
+
+class BulkFormTeacherRemarkCreate(BaseModel):
+    session_id: str
+    term_id: str
+    class_id: str
+    remarks: List[BulkFormTeacherRemarkItem]
 # Note: The other Staff dashboard schemas should already be in app/schemas/dashboard.py
 # If not, move StaffDashboardResponse, StaffClassResponse, etc., there.

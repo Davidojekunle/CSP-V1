@@ -1,17 +1,18 @@
 # app/services/result_service.py
 from sqlmodel import Session, select, and_, or_
 from fastapi import HTTPException
-from typing import List, Optional
+from typing import Any, List, Optional
 from collections import Counter
-
+from datetime import datetime, date, timedelta
 from sqlalchemy import case, distinct, func
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 from app.models import FormTeacherRemark, Enrollment, UserRole
 from app.models import (Result, User, StudentProfile, Class, Subject,
                          AcademicSession, Term, ClassSubject,
                            Enrollment, TermName)
 from app.schemas.result import BulkResultCreate, BulkResultItem, ResultResponse, ResultsEntryProgressResponse
+
 from app.utils.grade_calculator import calculate_detailed_grade 
 
 
@@ -397,11 +398,14 @@ def get_class_performance_report(
         }
 
 def publish_or_unpublish_results(
-    db: Session, session_id: str, term_id: str, class_id: Optional[str], publish: bool
+    db: Session, 
+    session_id: str, 
+    term_id: str, 
+    publish: bool,
+    class_id: Optional[str] = None,  # Added default value None
 ) -> tuple[int, List[User]]:
     """
-    Sets the is_published flag for a batch of results and returns the count
-    and a list of unique students affected.
+    Sets the is_published flag for a batch of results.
     """
     query = select(Result).where(
         Result.session_id == session_id,
@@ -412,7 +416,7 @@ def publish_or_unpublish_results(
 
     results = db.exec(query).all()
     if not results:
-        return 0, [] # Return empty if no results found
+        return 0, []
     
     affected_student_ids = list({res.student_id for res in results})
     
@@ -420,7 +424,7 @@ def publish_or_unpublish_results(
         result.is_published = publish
         db.add(result)
     
-    # PERFORMANCE: Fetch all affected student User objects in one query
+    # Fetch student objects for background email tasks
     students_to_notify = db.exec(select(User).where(User.id.in_(affected_student_ids))).all()
     
     db.commit()
@@ -521,35 +525,36 @@ def _get_rank_suffix(rank: int) -> str:
         return 'th'
     return {1: 'st', 2: 'nd', 3: 'rd'}.get(rank % 10, 'th')
 
+def _ensure_date(d: Any) -> Optional[date]:
+    """Ensures a value is a date object (converts string if needed)."""
+    if isinstance(d, date):
+        return d
+    if isinstance(d, str):
+        try:
+            return datetime.fromisoformat(d.split('T')[0]).date()
+        except:
+            return None
+    return None
 
-# --- ADD FUNCTION 1 of 3 (for Single Term Report) ---
+
 def get_data_for_detailed_report(student_id: str, session_id: str, term_id: str, db: Session) -> dict:
-    """
-    Fetches and processes all data required to generate a detailed report card.
-    This logic is moved from the original pdf_service.py.
-    """
     student = db.get(User, student_id)
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found")
+    if not student: raise HTTPException(status_code=404, detail="Student not found")
     
     student_profile = db.exec(select(StudentProfile).where(StudentProfile.user_id == student_id)).first()
-    
-    first_result = db.exec(select(Result).where(
+    student_results = db.exec(select(Result).where(
         Result.student_id == student_id, Result.session_id == session_id, Result.term_id == term_id
-    ).limit(1)).first()
-    if not first_result:
-        raise HTTPException(status_code=404, detail="No results found for this student in the specified term")
+    )).all()
+    
+    if not student_results: raise HTTPException(status_code=404, detail="No results found.")
 
-    class_id = first_result.class_id
-    class_obj = db.get(Class, class_id)
+    class_obj = db.get(Class, student_results[0].class_id)
     academic_session = db.get(AcademicSession, session_id)
     term = db.get(Term, term_id)
     
     all_class_results = db.exec(select(Result).where(
-        Result.class_id == class_id, Result.session_id == session_id, Result.term_id == term_id
+        Result.class_id == class_obj.id, Result.session_id == session_id, Result.term_id == term_id
     )).all()
-    
-    student_results = [res for res in all_class_results if res.student_id == student_id]
     
     results_by_subject = defaultdict(list)
     student_totals = defaultdict(float)
@@ -559,7 +564,6 @@ def get_data_for_detailed_report(student_id: str, session_id: str, term_id: str,
             student_totals[res.student_id] += res.total
 
     subject_averages = {sub_id: sum(s['total'] for s in scores) / len(scores) for sub_id, scores in results_by_subject.items() if scores}
-    
     subject_ranks = defaultdict(dict)
     for sub_id, scores in results_by_subject.items():
         sorted_scores = sorted(scores, key=lambda x: x['total'], reverse=True)
@@ -567,63 +571,62 @@ def get_data_for_detailed_report(student_id: str, session_id: str, term_id: str,
             subject_ranks[sub_id][score_data['student_id']] = f"{rank}{_get_rank_suffix(rank)}"
 
     final_results_data = []
-    subject_map = {sub.id: sub for sub in db.exec(select(Subject).where(Subject.id.in_([res.subject_id for res in student_results]))).all()}
+    subject_ids = [res.subject_id for res in student_results]
+    subject_map = {sub.id: sub for sub in db.exec(select(Subject).where(Subject.id.in_(subject_ids))).all()}
     
-    for res in sorted(student_results, key=lambda r: subject_map.get(r.subject_id).name if subject_map.get(r.subject_id) else ""):
+    for res in student_results:
         subject = subject_map.get(res.subject_id)
         if not subject: continue
-        
         grade, remark = calculate_detailed_grade(res.total)
         final_results_data.append({
-            'subject_name': subject.name, 'ca1': res.ca1, 'ca2': res.ca2, 'exam': res.exam,
-            'total': res.total, 'grade': grade, 'remark': remark,
+            'subject_name': str(subject.name or "Unknown"), 
+            'ca1': res.ca1 or 0, 'ca2': res.ca2 or 0, 'exam': res.exam or 0,
+            'total': res.total or 0, 'grade': str(grade), 'remark': str(remark),
             'class_average': subject_averages.get(res.subject_id, 0.0),
             'subject_position': subject_ranks.get(res.subject_id, {}).get(student_id, 'N/A')
         })
 
     ranked_students = sorted(student_totals.items(), key=lambda item: item[1], reverse=True)
-    class_position_str = "N/A"
+    class_pos = "N/A"
     for rank, (s_id, total) in enumerate(ranked_students, 1):
         if s_id == student_id:
-            class_position_str = f"{rank}{_get_rank_suffix(rank)}"
+            class_pos = f"{rank}{_get_rank_suffix(rank)}"
             break
             
-    student_total_score = student_totals.get(student_id, 0.0)
     num_subjects = len(final_results_data)
-    student_average = (student_total_score / num_subjects) if num_subjects > 0 else 0.0
+    student_average = (student_totals.get(student_id, 0.0) / num_subjects) if num_subjects > 0 else 0.0
     grade_counts = Counter(res['grade'] for res in final_results_data if res['grade'])
-    grades_summary_str = ", ".join([f"{count}({grade})" for grade, count in sorted(grade_counts.items())])
-    
-    summary_data = {
-        "overall_average": student_average, "class_position": class_position_str,
-        "total_students": len(ranked_students), "grades_summary": grades_summary_str
-    }
     
     remark_obj = db.exec(select(FormTeacherRemark).where(FormTeacherRemark.student_id == student_id, FormTeacherRemark.term_id == term_id)).first()
-    form_teacher_remark = remark_obj.remark_text if remark_obj else "No remark provided."
     
-    next_term_begins = term.end_date + timedelta(days=1)
-    next_term_ends = next_term_begins + timedelta(days=90)
-    
-    student_data = {
-        'student_name': f"{student.first_name} {student.last_name}",
-        'admission_number': student_profile.admission_number if student_profile else "N/A",
-        'username': student.username, 'gender': student.gender.value,
-        'email': student.email, 'phone': student.phone,
-        'profile_picture_url': student.profile_picture_url
-    }
-    
-    session_info = {
-        'session_name': academic_session.name, 'term_name': term.name.value,
-        'next_term_begins': next_term_begins.strftime('%B %d, %Y'),
-        'next_term_ends': next_term_ends.strftime('%B %d, %Y')
-    }
+    term_end = _ensure_date(term.end_date if term else None)
+    next_start = (term_end + timedelta(days=14)).strftime('%B %d, %Y') if term_end else "TBA"
+    next_end = (term_end + timedelta(days=104)).strftime('%B %d, %Y') if term_end else "TBA"
     
     return {
-        "student_data": student_data, "results_data": final_results_data,
-        "session_info": session_info, "summary_data": summary_data,
-        "form_teacher_remark": form_teacher_remark, "class_obj": class_obj
+        "student_data": {
+            'student_name': f"{str(student.first_name)} {str(student.last_name)}".upper(),
+            'admission_number': str(student_profile.admission_number) if student_profile else "N/A",
+            'username': str(student.username), 
+            'gender': str(student.gender.value) if hasattr(student.gender, 'value') else str(student.gender or "N/A"),
+            'email': str(student.email or "N/A"), 'phone': str(student.phone or "N/A"),
+            'profile_picture_url': student.profile_picture_url
+        },
+        "results_data": final_results_data,
+        "session_info": {
+            'session_name': str(academic_session.name) if academic_session else "N/A", 
+            'term_name': str(term.name.value) if term and hasattr(term.name, 'value') else str(term.name or "N/A"),
+            'next_term_begins': next_start, 'next_term_ends': next_end
+        },
+        "summary_data": {
+            "overall_average": float(student_average), "class_position": str(class_pos),
+            "total_students": int(len(ranked_students)), 
+            "grades_summary": ", ".join([f"{count}({grade})" for grade, count in sorted(grade_counts.items())])
+        },
+        "form_teacher_remark": str(remark_obj.remark_text) if remark_obj else "No remark provided.",
+        "class_obj": class_obj
     }
+
 
 
 # --- ADD FUNCTION 2 of 3 (for Cumulative Report) ---

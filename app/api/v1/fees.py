@@ -250,3 +250,30 @@ async def get_student_invoice_details(
     return _build_invoice_response(invoice, db)
 
 
+neutral_fee_router = APIRouter(prefix="/fees", tags=["Fee Management"])
+
+
+@neutral_fee_router.get("/invoices/by-student", response_model=List[InvoiceResponse])
+async def get_student_invoices(
+    student_id: Optional[str] = Query(None),
+    status: Optional[InvoiceStatus] = Query(None),
+    current_user_data: dict = Depends(get_current_active_user),
+    db: Session = Depends(get_session)
+):
+    """
+    PRESERVED: GET /fees/invoices/by-student
+    Logic handles both student and admin roles.
+    """
+    user = current_user_data["user"]
+    user_role = current_user_data["user_type"]
+    
+    target_student_id = user.id if user_role == UserRole.student else student_id
+
+    if user_role == UserRole.admin and not target_student_id:
+         raise HTTPException(status_code=400, detail="Admin must provide student_id")
+
+    # Re-use the service logic we already have
+    # (Assuming you have a get_student_invoices function in fee_service)
+    invoices = db.exec(select(Invoice).where(Invoice.student_id == target_student_id)).all()
+    
+    return [_build_invoice_response(inv, db) for inv in invoices]

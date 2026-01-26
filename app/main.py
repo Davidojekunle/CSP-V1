@@ -23,9 +23,10 @@ from app.api.v1 import academic as academic_router
 from app.api.v1 import enrollments as enrollment_router
 from app.api.v1 import activity_logs as activity_logs_router  
 from app.api.v1 import results as results_router
-from app.api.v1.fees import router as admin_fees_router, student_router as student_fees_router
+from app.api.v1.fees import router as admin_fees_router, student_router as student_fees_router, neutral_fee_router
 from app.api.v1 import payments as payments_router
-from app.api.v1.staff import router as staff_routes
+from app.api.v1.staff import router as staff_routes, traits_router
+from app.api.v1.students import router as student_routes
 
 # Create FastAPI app
 app = FastAPI(
@@ -56,6 +57,9 @@ app.include_router(admin_fees_router)
 app.include_router(student_fees_router)
 app.include_router(payments_router.router)
 app.include_router(staff_routes)
+app.include_router(traits_router)
+app.include_router(student_routes)
+app.include_router(neutral_fee_router)
 # app.include_router(admin_routes)
 # app.include_router(academic_routes)
 # app.include_router(enrollment_routes)

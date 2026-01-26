@@ -3,22 +3,22 @@ from sqlmodel import Session, select, and_
 from typing import List, Dict, Optional
 
 from app.core.database import get_session
-from app.core.auth import get_current_admin, get_current_staff_or_admin, get_current_active_user
+from app.core.auth import get_current_admin, get_current_staff_or_admin, get_current_active_user, get_current_staff
 from app.models import User, UserRole, Result, AcademicSession, Term
 from app.schemas.result import (BulkResultCreate, ResultResponse, BulkResultItem, ClassResultSummary,
 ResultsDashboardStats, ResultsEntryProgressResponse, PublicationReadinessResponse)
+from app.schemas.result import BulkFormTeacherRemarkCreate
+from app.services import staff_service
 
 from app.services import result_service
 from app.services.pdf.report_card import report_card_service
 
 router = APIRouter(
     prefix="/results",
-    tags=["Results Management"],
-    dependencies=[Depends(get_current_staff_or_admin)]
+    tags=["Results Management"]
 )
 
-
-@router.post("/bulk", status_code=status.HTTP_201_CREATED)
+@router.post("/bulk", status_code=status.HTTP_201_CREATED, dependencies=[Depends(get_current_staff_or_admin)])
 async def bulk_create_or_update_results(
     bulk_data: BulkResultCreate,
     db: Session = Depends(get_session)
@@ -46,19 +46,24 @@ async def get_results(
     student_id: Optional[str] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
-    current_user = Depends(get_current_active_user),
-    session: Session = Depends(get_session),
+    current_user_data: dict = Depends(get_current_active_user), # Use dict to unpack correctly
     db: Session = Depends(get_session)
 ):
-    """Get results with filtering and pagination"""
+    """
+    Get results with filtering. 
+    Students: Only see their own published results.
+    Staff/Admin: See everything filtered.
+    """
+    user = current_user_data["user"]
     
+    # Delegate to optimized service
     results_data = result_service.get_filtered_results(
-        db, user=current_user['user'], session_id=session_id, term_id=term_id, class_id=class_id,
+        db, user=user, session_id=session_id, term_id=term_id, class_id=class_id,
         subject_id=subject_id, student_id=student_id, skip=skip, limit=limit
     )
     return results_data
 
-@router.get("/class/{class_id}/report", response_model=ClassResultSummary)
+@router.get("/class/{class_id}/report", response_model=ClassResultSummary, dependencies=[Depends(get_current_staff_or_admin)])
 async def get_class_performance_report(
     class_id: str, session_id: str = Query(...), term_id: str = Query(...),
     subject_id: Optional[str] = Query(None),
@@ -113,7 +118,7 @@ async def publish_results(
     return {"message": f"Published {len(results)} results successfully"}
 
 # PRESERVED: PUT /results/unpublish
-@router.put("/unpublish")
+@router.put("/results/unpublish", dependencies=[Depends(get_current_staff_or_admin)])
 async def unpublish_results(
     session_id: str = Query(...), term_id: str = Query(...),
     db: Session = Depends(get_session)
@@ -121,28 +126,46 @@ async def unpublish_results(
     count = result_service.publish_or_unpublish_results(db, session_id, term_id, publish=False)
     return {"message": f"Unpublished {count} results successfully"}
 
-@router.get("/student/report-card/download", summary="Download Single Term Report Card")
+@router.get("/student/report-card/download")
 async def download_student_report_card(
-    session_id: str = Query(...), term_id: str = Query(...),
+    session_id: str = Query(...), 
+    term_id: str = Query(...),
     student_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_active_user),
+    current_user_data: dict = Depends(get_current_active_user),
     db_session: Session = Depends(get_session)
 ):
-    user = current_user['user']
-    target_student_id = user.id if user.role == UserRole.student else student_id
-    if not target_student_id:
-        raise HTTPException(status_code=400, detail="Student ID is required.")
+    """
+    PRESERVED: Download report card.
+    FIXED: Proper dict unpacking and error handling.
+    """
+    try:
+        user = current_user_data["user"]
+        user_role = current_user_data["user_type"]
 
-    # Call the new, refactored service method
-    pdf_content, filename = report_card_service.generate_detailed_student_report(
-        student_id=target_student_id,
-        session_id=session_id,
-        term_id=term_id,
-        db_session=db_session
-    )
-    
-    return Response(content=pdf_content, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={filename}"})
-    
+        # Logic: Students get their own ID; Admin/Staff use the query param
+        target_id = user.id if user_role == UserRole.student else student_id
+        
+        if not target_id:
+            raise HTTPException(status_code=400, detail="Student ID is required.")
+
+        pdf_content, filename = report_card_service.generate_detailed_student_report(
+            target_id, session_id, term_id, db_session
+        )
+        
+        return Response(
+            content=pdf_content, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        # This will print the EXACT error in your console to help us debug
+        print(f"PDF DOWNLOAD ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal server error generating PDF")
+
 @router.get("/student/cumulative-report/download", summary="Download Cumulative Report Card")
 async def download_cumulative_report_card(
     session_id: str = Query(...), term_id: str = Query(...),
@@ -205,3 +228,18 @@ async def get_publication_readiness(
     """Checks for completeness of results entry before publishing."""
     readiness_data = result_service.check_publication_readiness(session_id, term_id, class_id, db)
     return readiness_data
+
+@router.post("/remarks/form-teacher/bulk", status_code=status.HTTP_201_CREATED)
+async def add_bulk_form_teacher_remarks(
+    bulk_data: BulkFormTeacherRemarkCreate,
+    current_staff: User = Depends(get_current_staff),
+    db: Session = Depends(get_session)
+):
+    """
+    Add or update form teacher remarks for multiple students in a class at once.
+    Only the assigned form teacher for the specified class can perform this action.
+    """
+    processed_count = staff_service.bulk_create_or_update_form_teacher_remarks(
+        staff_user=current_staff, bulk_data=bulk_data, db=db
+    )
+    return {"message": f"Successfully processed {processed_count} student remarks."}
