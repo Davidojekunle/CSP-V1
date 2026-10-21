@@ -1,34 +1,39 @@
 # app/services/fee_service.py
 """Service layer for Fee and Fee Assignment management."""
-from sqlmodel import Session, select, and_
-from fastapi import HTTPException
-from typing import Counter, Dict, List, Optional
-from sqlalchemy import func, or_
+import uuid
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
 
-from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, Fee, TargetType, InvoiceStatus, Payment, UserRole
+from fastapi import HTTPException
+from sqlalchemy import func, or_, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select, and_
+
+from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, TargetType, InvoiceStatus, Payment
 from app.models.base import PaymentStatus
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeAssignmentCreate
-from datetime import date, datetime
-import uuid
 
-def create_fee(fee_data: FeeCreate, db: Session) -> Fee:
-    if db.exec(select(Fee).where(Fee.name == fee_data.name)).first():
+async def create_fee(fee_data: FeeCreate, db: AsyncSession) -> Fee:
+    result = await db.execute(select(Fee).where(Fee.name == fee_data.name))
+    if result.scalars().first():
         raise HTTPException(status_code=400, detail="Fee with this name already exists")
     
     new_fee = Fee.model_validate(fee_data)
     db.add(new_fee)
-    db.commit()
-    db.refresh(new_fee)
+    await db.commit()
+    await db.refresh(new_fee)
     return new_fee
 
-def get_all_fees(db: Session, is_active: Optional[bool]) -> List[Fee]:
+async def get_all_fees(db: AsyncSession, is_active: Optional[bool]) -> List[Fee]:
     query = select(Fee)
     if is_active is not None:
         query = query.where(Fee.is_active == is_active)
-    return db.exec(query).all()
+    result = await db.execute(query)
+    return result.scalars().all()
 
-def update_fee(fee_id: str, fee_data: FeeUpdate, db: Session) -> Fee:
-    fee = db.get(Fee, fee_id)
+async def update_fee(fee_id: str, fee_data: FeeUpdate, db: AsyncSession) -> Fee:
+    fee = await db.get(Fee, fee_id)
     if not fee:
         raise HTTPException(status_code=404, detail="Fee not found")
     
@@ -37,30 +42,31 @@ def update_fee(fee_id: str, fee_data: FeeUpdate, db: Session) -> Fee:
         setattr(fee, key, value)
         
     db.add(fee)
-    db.commit()
-    db.refresh(fee)
+    await db.commit()
+    await db.refresh(fee)
     return fee
 
-def create_fee_assignment(assign_data: FeeAssignmentCreate, db: Session):
-    if not db.get(Fee, assign_data.fee_id):
+async def create_fee_assignment(assign_data: FeeAssignmentCreate, db: AsyncSession):
+    if not await db.get(Fee, assign_data.fee_id):
         raise HTTPException(status_code=404, detail="Fee not found")
-    if not db.get(AcademicSession, assign_data.session_id) or not db.get(Term, assign_data.term_id):
+    if not await db.get(AcademicSession, assign_data.session_id) or not await db.get(Term, assign_data.term_id):
         raise HTTPException(status_code=404, detail="Session or term not found")
     
     # Validation for existing assignment
-    existing = db.exec(select(FeeAssignment).where(
+    result = await db.execute(select(FeeAssignment).where(
         FeeAssignment.fee_id == assign_data.fee_id,
         FeeAssignment.session_id == assign_data.session_id,
         FeeAssignment.term_id == assign_data.term_id,
         FeeAssignment.target_type == assign_data.target_type,
         FeeAssignment.target_id == assign_data.target_id
-    )).first()
+    ))
+    existing = result.scalars().first()
     if existing:
         raise HTTPException(status_code=400, detail="This exact fee assignment already exists")
         
     new_assignment = FeeAssignment.model_validate(assign_data)
     db.add(new_assignment)
-    db.commit()
+    await db.commit()
 
 def _generate_invoice_number() -> str:
 
@@ -75,18 +81,20 @@ def parse_date(date_string: str) -> date:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-def generate_invoices_for_term(req: dict, db: Session) -> dict:
+async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
     due_date = parse_date(req['due_date']) # Assuming _parse_date exists
     
     # 1. Get all relevant fee assignments and fees
-    fee_assignments = db.exec(select(FeeAssignment).where(
+    result = await db.execute(select(FeeAssignment).where(
         FeeAssignment.session_id == req['session_id'], FeeAssignment.term_id == req['term_id']
-    )).all()
+    ))
+    fee_assignments = result.scalars().all()
     if not fee_assignments:
         raise HTTPException(status_code=404, detail="No fee assignments found for this term.")
     
     fee_ids = {fa.fee_id for fa in fee_assignments}
-    fees_map = {fee.id: fee for fee in db.exec(select(Fee).where(Fee.id.in_(list(fee_ids)), Fee.is_active == True)).all()}
+    result = await db.execute(select(Fee).where(Fee.id.in_(list(fee_ids)), Fee.is_active == True))
+    fees_map = {fee.id: fee for fee in result.scalars().all()}
 
     # 2. Get target students via their enrollments
     enrollment_query = select(Enrollment).where(
@@ -97,12 +105,29 @@ def generate_invoices_for_term(req: dict, db: Session) -> dict:
     elif req['scope'] == 'students':
         enrollment_query = enrollment_query.where(Enrollment.student_id.in_(req['target_ids']))
     
-    enrollments = db.exec(enrollment_query).all()
+    result = await db.execute(enrollment_query)
+    enrollments = result.scalars().all()
     if not enrollments:
         raise HTTPException(status_code=404, detail=f"No active enrollments found for the scope.")
 
+    # Prefetch existing invoices and their items for everyone in scope (2 queries instead of 2 per student)
+    student_ids = list({e.student_id for e in enrollments})
+    existing_invoices = {}
+    for inv in (await db.execute(select(Invoice).where(
+        Invoice.student_id.in_(student_ids),
+        Invoice.session_id == req['session_id'],
+        Invoice.term_id == req['term_id']
+    ).order_by(Invoice.created_at))).scalars().all():
+        existing_invoices.setdefault(inv.student_id, inv)
+    existing_fee_ids = defaultdict(set)
+    if existing_invoices:
+        for item in (await db.execute(select(InvoiceItem).where(
+            InvoiceItem.invoice_id.in_([inv.id for inv in existing_invoices.values()])
+        ))).scalars().all():
+            existing_fee_ids[item.invoice_id].add(item.fee_id)
+
     created_count, updated_count = 0, 0
-    
+
     for enrollment in enrollments:
         # Determine applicable fees for this student
         applicable_fees = []
@@ -113,18 +138,13 @@ def generate_invoices_for_term(req: dict, db: Session) -> dict:
                (assign.target_type == TargetType.class_ and assign.target_id == enrollment.class_id) or
                (assign.target_type == TargetType.student and assign.target_id == enrollment.student_id)):
                 applicable_fees.append(fee)
-        
+
         if not applicable_fees: continue
 
-        # Check for an existing invoice to either create or update
-        existing_invoice = db.exec(select(Invoice).where(
-            Invoice.student_id == enrollment.student_id,
-            Invoice.session_id == req['session_id'],
-            Invoice.term_id == req['term_id']
-        )).first()
+        existing_invoice = existing_invoices.get(enrollment.student_id)
 
         if not existing_invoice:
-            # CREATE new invoice
+            # CREATE new invoice (id is generated client-side, so no flush is needed)
             total = sum(fee.amount for fee in applicable_fees)
             new_invoice = Invoice(
                 invoice_number=_generate_invoice_number(), student_id=enrollment.student_id,
@@ -132,59 +152,57 @@ def generate_invoices_for_term(req: dict, db: Session) -> dict:
                 due_date=due_date, total_amount=total, balance_due=total
             )
             db.add(new_invoice)
-            db.flush() # Get ID for items
             for fee in applicable_fees:
                 db.add(InvoiceItem(invoice_id=new_invoice.id, fee_id=fee.id, description=fee.name, amount=fee.amount))
+            # A student can have several enrollments in a session; don't invoice them twice
+            existing_invoices[enrollment.student_id] = new_invoice
+            existing_fee_ids[new_invoice.id] = {fee.id for fee in applicable_fees}
             created_count += 1
         else:
             # UPDATE existing invoice (add missing fees)
             if existing_invoice.status == InvoiceStatus.cancelled: continue
-            
-            existing_fee_ids = {item.fee_id for item in existing_invoice.items}
-            fees_to_add = [fee for fee in applicable_fees if fee.id not in existing_fee_ids]
-            
+
+            fees_to_add = [fee for fee in applicable_fees if fee.id not in existing_fee_ids[existing_invoice.id]]
+
             if fees_to_add:
                 amount_to_add = sum(fee.amount for fee in fees_to_add)
                 for fee in fees_to_add:
                     db.add(InvoiceItem(invoice_id=existing_invoice.id, fee_id=fee.id, description=fee.name, amount=fee.amount))
-                
+                existing_fee_ids[existing_invoice.id].update(fee.id for fee in fees_to_add)
+
                 existing_invoice.total_amount += amount_to_add
                 existing_invoice.balance_due += amount_to_add
                 if existing_invoice.status == InvoiceStatus.paid:
                     existing_invoice.status = InvoiceStatus.partial
                 db.add(existing_invoice)
                 updated_count += 1
-                
-    db.commit()
+
+    await db.commit()
     return {"created": created_count, "updated": updated_count}
 
 
-def _update_overdue_invoices(db: Session):
+async def _update_overdue_invoices(db: AsyncSession):
     """
-    Helper to transition issued/partial invoices to overdue status.
-    This is preserved from the original logic.
+    Transitions issued/partial invoices past their due date to overdue,
+    with a single UPDATE statement.
     """
-    today = date.today()
-    invoices_to_update = db.exec(select(Invoice).where(
-        Invoice.due_date < today,
+    result = await db.execute(update(Invoice).where(
+        Invoice.due_date < date.today(),
         Invoice.balance_due > 0,
         Invoice.status.in_([InvoiceStatus.issued, InvoiceStatus.partial])
-    )).all()
+    ).values(status=InvoiceStatus.overdue))
+    if result.rowcount:
+        await db.commit()
 
-    if invoices_to_update:
-        for invoice in invoices_to_update:
-            invoice.status = InvoiceStatus.overdue
-        db.commit()
-
-def get_all_invoices(
-    db: Session, skip: int, limit: int,
+async def get_all_invoices(
+    db: AsyncSession, skip: int, limit: int,
     status: Optional[InvoiceStatus], session_id: Optional[str],
     term_id: Optional[str], search: Optional[str]
 ) -> tuple[List[Invoice], int]:
     """
     PERFORMANCE: Fetches a paginated list of all invoices with filtering and search.
     """
-    _update_overdue_invoices(db) # Ensure statuses are current before querying
+    await _update_overdue_invoices(db) # Ensure statuses are current before querying
 
     base_query = select(Invoice)
     count_query = select(func.count(Invoice.id))
@@ -211,15 +229,17 @@ def get_all_invoices(
         base_query = base_query.where(applied_conditions)
         count_query = count_query.where(applied_conditions)
 
-    total_count = db.exec(count_query).one()
-    invoices = db.exec(base_query.offset(skip).limit(limit).order_by(Invoice.created_at.desc())).all()
+    result_count = await db.execute(count_query)
+    total_count = result_count.scalar_one()
+    result_invoices = await db.execute(base_query.order_by(Invoice.created_at.desc(), Invoice.id).offset(skip).limit(limit))
+    invoices = result_invoices.scalars().all()
     
     return invoices, total_count
 
 
-def cancel_invoice(invoice_id: str, db: Session) -> Invoice:
+async def cancel_invoice(invoice_id: str, db: AsyncSession) -> Invoice:
     """Cancels an invoice if it has no payments."""
-    invoice = db.get(Invoice, invoice_id)
+    invoice = await db.get(Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
     if invoice.status == InvoiceStatus.paid:
@@ -230,45 +250,64 @@ def cancel_invoice(invoice_id: str, db: Session) -> Invoice:
     invoice.status = InvoiceStatus.cancelled
     invoice.updated_at = datetime.utcnow()
     db.add(invoice)
-    db.commit()
-    db.refresh(invoice)
+    await db.commit()
+    await db.refresh(invoice)
     return invoice
 
-# In app/services/fee_service.py
-def get_dashboard_stats(db: Session, session_id: Optional[str], term_id: Optional[str]) -> dict:
-    # This is a direct migration of your original logic
-    invoice_query = select(Invoice)
-    if session_id: invoice_query = invoice_query.where(Invoice.session_id == session_id)
-    if term_id: invoice_query = invoice_query.where(Invoice.term_id == term_id)
-    
-    all_invoices = db.exec(invoice_query).all()
-    
-    # Financial calculations should exclude cancelled/draft
-    financially_relevant = [inv for inv in all_invoices if inv.status not in [InvoiceStatus.cancelled, InvoiceStatus.draft]]
-    
-    total_invoiced = sum(inv.total_amount for inv in financially_relevant)
-    total_outstanding = sum(inv.balance_due for inv in financially_relevant)
-    
-    # Payment queries
-    payment_query = select(Payment).where(Payment.status == PaymentStatus.successful)
-    if financially_relevant:
-        payment_query = payment_query.where(Payment.invoice_id.in_([inv.id for inv in financially_relevant]))
-    
-    successful_payments = db.exec(payment_query).all()
-    total_paid = sum(p.amount for p in successful_payments)
+async def get_dashboard_stats(db: AsyncSession, session_id: Optional[str], term_id: Optional[str]) -> dict:
+    """Fee dashboard figures, computed with aggregate queries."""
+    invoice_conditions = []
+    if session_id: invoice_conditions.append(Invoice.session_id == session_id)
+    if term_id: invoice_conditions.append(Invoice.term_id == term_id)
+    # Financial calculations exclude cancelled/draft invoices
+    relevant = and_(*invoice_conditions, Invoice.status.notin_([InvoiceStatus.cancelled, InvoiceStatus.draft]))
 
-    status_counts = Counter(inv.status.value for inv in all_invoices)
-    payment_methods = Counter(p.payment_method.value for p in successful_payments if p.payment_method)
-    
+    status_counts = {
+        (status.value if hasattr(status, "value") else status): count
+        for status, count in (await db.execute(
+            select(Invoice.status, func.count(Invoice.id)).where(*invoice_conditions).group_by(Invoice.status)
+        )).all()
+    }
+    total_invoiced, total_outstanding = (await db.execute(
+        select(func.coalesce(func.sum(Invoice.total_amount), 0.0), func.coalesce(func.sum(Invoice.balance_due), 0.0)).where(relevant)
+    )).one()
+
+    paid_base = (
+        select(Payment.payment_method, func.count(Payment.id), func.coalesce(func.sum(Payment.amount), 0.0))
+        .join(Invoice, Payment.invoice_id == Invoice.id)
+        .where(Payment.status == PaymentStatus.successful, relevant)
+    )
+    total_paid, payment_methods = 0.0, {}
+    for method, count, amount in (await db.execute(paid_base.group_by(Payment.payment_method))).all():
+        total_paid += amount
+        if method:
+            key = method.value if hasattr(method, "value") else method
+            payment_methods[key] = payment_methods.get(key, 0) + count
+
+    recent_payments = (await db.execute(
+        select(func.count(Payment.id))
+        .join(Invoice, Payment.invoice_id == Invoice.id)
+        .where(Payment.status == PaymentStatus.successful, relevant,
+               Payment.paid_at >= datetime.utcnow() - timedelta(days=8))
+    )).scalar_one()
+
     return {
-        "total_invoices": len(all_invoices), "total_invoiced": total_invoiced,
-        "total_paid": total_paid, "total_outstanding": total_outstanding,
+        "total_invoices": sum(status_counts.values()), "total_invoiced": float(total_invoiced),
+        "total_paid": float(total_paid), "total_outstanding": float(total_outstanding),
         "collection_rate": round((total_paid / total_invoiced * 100) if total_invoiced > 0 else 0, 2),
-        "status_breakdown": dict(status_counts), "payment_methods": dict(payment_methods),
-        "recent_payments": sum(1 for p in successful_payments if p.paid_at and (datetime.utcnow() - p.paid_at).days <= 7)
+        "status_breakdown": status_counts, "payment_methods": payment_methods,
+        "recent_payments": recent_payments
     }
 
-def get_fee_assignments_by_target(session_id: str, term_id: str, target_type: Optional[TargetType], db: Session) -> Dict:
+
+async def get_invoices_for_student(student_id: str, status: Optional[InvoiceStatus], db: AsyncSession) -> List[dict]:
+    query = select(Invoice).where(Invoice.student_id == student_id)
+    if status:
+        query = query.where(Invoice.status == status)
+    invoices = (await db.execute(query.order_by(Invoice.created_at.desc()))).scalars().all()
+    return await _build_invoice_responses_bulk(invoices, db)
+
+async def get_fee_assignments_by_target(session_id: str, term_id: str, target_type: Optional[TargetType], db: AsyncSession) -> Dict:
     """
     Fetches fee assignments for a given term and groups them by their target type.
     """
@@ -279,16 +318,20 @@ def get_fee_assignments_by_target(session_id: str, term_id: str, target_type: Op
     if target_type:
         query = query.where(FeeAssignment.target_type == target_type)
     
-    assignments = db.exec(query).all()
+    result_assignments = await db.execute(query)
+    assignments = result_assignments.scalars().all()
 
     # PERFORMANCE: Fetch all related objects (fees, classes, users) in bulk
     fee_ids = {a.fee_id for a in assignments}
     class_ids = {a.target_id for a in assignments if a.target_type == TargetType.class_}
     student_ids = {a.target_id for a in assignments if a.target_type == TargetType.student}
 
-    fees_map = {f.id: f for f in db.exec(select(Fee).where(Fee.id.in_(fee_ids))).all()} if fee_ids else {}
-    classes_map = {c.id: c for c in db.exec(select(Class).where(Class.id.in_(class_ids))).all()} if class_ids else {}
-    students_map = {u.id: u for u in db.exec(select(User).where(User.id.in_(student_ids))).all()} if student_ids else {}
+    result_fees = await db.execute(select(Fee).where(Fee.id.in_(fee_ids)))
+    fees_map = {f.id: f for f in result_fees.scalars().all()} if fee_ids else {}
+    result_classes = await db.execute(select(Class).where(Class.id.in_(class_ids)))
+    classes_map = {c.id: c for c in result_classes.scalars().all()} if class_ids else {}
+    result_students = await db.execute(select(User).where(User.id.in_(student_ids)))
+    students_map = {u.id: u for u in result_students.scalars().all()} if student_ids else {}
 
     # Group the results in memory (fast)
     grouped = {"school": [], "classes": [], "students": []}
@@ -319,3 +362,58 @@ def get_fee_assignments_by_target(session_id: str, term_id: str, target_type: Op
         "assignments_by_target": grouped,
         "total_assignments": len(assignments)
     }
+
+async def _build_invoice_responses_bulk(invoices: List[Invoice], db: AsyncSession) -> List[dict]:
+    """
+    PERFORMANCE OPTIMIZED: Builds detailed invoice responses by fetching all
+    related data in a minimal number of bulk queries, avoiding N+1.
+    """
+    if not invoices:
+        return []
+
+    invoice_ids = [inv.id for inv in invoices]
+    student_ids = list({inv.student_id for inv in invoices})
+    session_ids = list({inv.session_id for inv in invoices})
+    term_ids = list({inv.term_id for inv in invoices})
+
+    # Bulk fetch all related data in one go
+    result_students = await db.execute(select(User).where(User.id.in_(student_ids)))
+    students_map = {u.id: u for u in result_students.scalars().all()}
+    result_sessions = await db.execute(select(AcademicSession).where(AcademicSession.id.in_(session_ids)))
+    sessions_map = {s.id: s for s in result_sessions.scalars().all()}
+    result_terms = await db.execute(select(Term).where(Term.id.in_(term_ids)))
+    terms_map = {t.id: t for t in result_terms.scalars().all()}
+    
+    # Group items and payments by invoice_id
+    result_items = await db.execute(select(InvoiceItem).where(InvoiceItem.invoice_id.in_(invoice_ids)))
+    items_map = defaultdict(list)
+    for item in result_items.scalars().all():
+        items_map[item.invoice_id].append({"description": item.description, "amount": item.amount})
+        
+    result_payments = await db.execute(select(Payment).where(Payment.invoice_id.in_(invoice_ids)))
+    payments_map = defaultdict(list)
+    for p in result_payments.scalars().all():
+        payments_map[p.invoice_id].append({
+            "id": p.id, "amount": p.amount, "status": p.status.value,
+            "paid_at": p.paid_at, "payment_method": p.payment_method.value if p.payment_method else None
+        })
+
+    # Assemble the final response list in memory
+    response_list = []
+    for inv in invoices:
+        student = students_map.get(inv.student_id)
+        session_obj = sessions_map.get(inv.session_id)
+        term_obj = terms_map.get(inv.term_id)
+        
+        response_list.append({
+            "id": inv.id, "invoice_number": inv.invoice_number,
+            "student_name": f"{student.first_name} {student.last_name}" if student else "N/A",
+            "session_name": session_obj.name if session_obj else "N/A",
+            "term_name": term_obj.name.value if term_obj else "N/A",
+            "status": inv.status, "due_date": inv.due_date,
+            "total_amount": inv.total_amount, "paid_amount": inv.paid_amount,
+            "balance_due": inv.balance_due,
+            "items": items_map.get(inv.id, []),
+            "payments": payments_map.get(inv.id, [])
+        })
+    return response_list

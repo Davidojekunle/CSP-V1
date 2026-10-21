@@ -2,8 +2,9 @@
 """
 Service for orchestrating the generation of Invoice PDFs.
 """
-from sqlmodel import Session, select, and_
+from sqlmodel import select, and_
 from io import BytesIO
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.pdf.generator import SchoolReportGenerator # Assuming a generic generator, can be specified
 from app.models import Invoice, InvoiceItem, Payment, User, StudentProfile, AcademicSession, Term, Enrollment, Class
@@ -13,25 +14,25 @@ class InvoicePDFService:
         # We can create a more specific PDF generator for invoices if needed
         self.generator = SchoolReportGenerator() # Re-using for now
 
-    def _get_invoice_data(self, invoice_id: str, db: Session) -> dict:
+    async def _get_invoice_data(self, invoice_id: str, db: AsyncSession) -> dict:
         """Gathers all necessary data for rendering an invoice PDF."""
-        invoice = db.get(Invoice, invoice_id)
+        invoice = await db.get(Invoice, invoice_id)
         if not invoice:
             return None
 
-        student = db.get(User, invoice.student_id)
-        profile = db.exec(select(StudentProfile).where(StudentProfile.user_id == invoice.student_id)).first()
-        ac_session = db.get(AcademicSession, invoice.session_id)
-        term = db.get(Term, invoice.term_id)
+        student = await db.get(User, invoice.student_id)
+        profile = (await db.execute(select(StudentProfile).where(StudentProfile.user_id == invoice.student_id))).scalars().first()
+        ac_session = await db.get(AcademicSession, invoice.session_id)
+        term = await db.get(Term, invoice.term_id)
         
-        enrollment = db.exec(select(Enrollment).where(
+        enrollment = (await db.execute(select(Enrollment).where(
             Enrollment.student_id == invoice.student_id,
             Enrollment.session_id == invoice.session_id,
-        )).first()
-        class_obj = db.get(Class, enrollment.class_id) if enrollment else None
+        ))).scalars().first()
+        class_obj = await db.get(Class, enrollment.class_id) if enrollment else None
 
-        items = db.exec(select(InvoiceItem).where(InvoiceItem.invoice_id == invoice.id)).all()
-        payments = db.exec(select(Payment).where(Payment.invoice_id == invoice.id, Payment.status == "successful")).all()
+        items = (await db.execute(select(InvoiceItem).where(InvoiceItem.invoice_id == invoice.id))).scalars().all()
+        payments = (await db.execute(select(Payment).where(Payment.invoice_id == invoice.id, Payment.status == "successful"))).scalars().all()
 
         return {
             "invoice_number": invoice.invoice_number,
@@ -54,9 +55,9 @@ class InvoicePDFService:
             } for p in payments]
         }
         
-    def generate_invoice_pdf(self, invoice_id: str, db: Session) -> BytesIO:
+    async def generate_invoice_pdf(self, invoice_id: str, db: AsyncSession) -> BytesIO:
         """Generates the invoice PDF and returns it as an in-memory BytesIO buffer."""
-        invoice_data = self._get_invoice_data(invoice_id, db)
+        invoice_data = await self._get_invoice_data(invoice_id, db)
         if not invoice_data:
             raise ValueError("Could not find data for the specified invoice.")
 

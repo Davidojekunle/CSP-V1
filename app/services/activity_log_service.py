@@ -3,12 +3,12 @@
 Service for logging user activities.
 PRESERVED: The logic is identical to the original log_activity function.
 """
-from sqlmodel import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import User, ActivityLog, ActivityAction
 from app.core.config import settings
 
 async def log_activity(
-    session: Session,
+    session: AsyncSession,
     actor: User,
     action: ActivityAction,
     details: str,

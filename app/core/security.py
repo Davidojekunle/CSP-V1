@@ -1,12 +1,12 @@
 from passlib.context import CryptContext
+from anyio.to_thread import run_sync
 
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
 
 
-def get_password_hash(password):
-    """Hash a password"""
-    return pwd_context.hash(password)
+async def get_password_hash(password: str):
+    return await run_sync(pwd_context.hash, password)
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
+async def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a plain password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    return await run_sync(pwd_context.verify, plain_password, hashed_password)

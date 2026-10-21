@@ -3,35 +3,44 @@
 Contains the low-level PDF generation class using ReportLab.
 This class should only be concerned with drawing data onto a PDF canvas.
 """
-from fastapi import HTTPException, status    
-from app.models import TermName, FormTeacherRemark, User, UserRole, Term, StudentProfile, AcademicSession, Class, Result, Enrollment, Subject
-from app.utils.grade_calculator import calculate_detailed_grade
-# ... etc.
-from sqlmodel import Session, select, and_
-from typing import List, Dict, Tuple
-from datetime import datetime, timedelta
-from io import BytesIO
-import zipfile
-import re
-from collections import defaultdict
-from collections import Counter
-
-from reportlab.lib import colors
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
-from reportlab.lib.pagesizes import landscape, A4 #<-- Import landscape
-from reportlab.lib.utils import ImageReader
-
-
+import logging
 import os
 from io import BytesIO
 
-# ... etc.
+import httpx
+from PIL import Image as PILImage
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import landscape, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+
+from app.core.config import settings
+from app.models.base import TermName
+from app.utils.grade_calculator import calculate_detailed_grade
+
+logger = logging.getLogger(__name__)
+_missing_logo_warned = False
+
+
+def _thumbnail(image_bytes: bytes, size: int = 300) -> BytesIO:
+    """Downscale a photo to ~300 DPI for a 1-inch box (full-size uploads make PDFs huge)."""
+    with PILImage.open(BytesIO(image_bytes)) as img:
+        img = img.convert("RGB")
+        img.thumbnail((size, size))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=85)
+    out.seek(0)
+    return out
+
+
+def _warn_missing_logo(path: str):
+    global _missing_logo_warned
+    if not _missing_logo_warned:
+        logger.warning("School logo not found at %r (set PDF_LOGO_PATH); rendering without it.", path)
+        _missing_logo_warned = True
+
 
 class SchoolReportGenerator:
     """Handles the low-level creation of PDF documents for student reports."""
@@ -56,21 +65,23 @@ class SchoolReportGenerator:
 
     def _get_logo_and_photo(self, photo_url: str):
         # ADJUSTED: Logo size reduced for a more compact header
-        logo_path = os.path.join("school_logo.png") # Make sure you have this file
+        logo_path = settings.PDF_LOGO_PATH
         if os.path.exists(logo_path):
             logo = Image(logo_path, width=1.2*inch, height=1.2*inch)
         else:
-            logo = Spacer(1.2*inch, 1.2*inch) 
-            print("Warning: school_logo.png not found.")
+            logo = Spacer(1.2*inch, 1.2*inch)
+            _warn_missing_logo(logo_path)
 
         # Student photo logic remains the same
         photo = None
         if photo_url:
             try:
-                # Use a placeholder if URL fails
-                photo = Image(ImageReader(photo_url), width=1*inch, height=1*inch)
+                # Runs in a worker thread (see ReportCardService); bounded so a slow CDN can't hang it
+                response = httpx.get(photo_url, timeout=5.0, follow_redirects=True)
+                response.raise_for_status()
+                photo = Image(_thumbnail(response.content), width=1*inch, height=1*inch)
             except Exception as e:
-                print(f"Warning: Could not load student photo from URL {photo_url}. Error: {e}")
+                logger.warning("Could not load student photo from %s: %s", photo_url, e)
                 photo = None
 
         if not photo:
@@ -84,7 +95,7 @@ class SchoolReportGenerator:
 
     def _draw_watermark(self, canvas, doc):
         canvas.saveState()
-        watermark_path = os.path.join("school_logo.png")
+        watermark_path = settings.PDF_LOGO_PATH
         if not os.path.exists(watermark_path):
             canvas.restoreState()
             return
@@ -97,10 +108,6 @@ class SchoolReportGenerator:
         y_centered = (page_height - img_height) / 2
         canvas.drawImage(watermark_path, x_centered, y_centered, width=img_width, height=img_height, mask='auto')
         canvas.restoreState()
-
-    # In your SchoolReportGenerator class
-
-    # In your SchoolReportGenerator class
 
     def generate_detailed_report_card(self, student_data, results_data, session_info, summary_data, form_teacher_remark, class_obj):
         buffer = BytesIO()
@@ -239,161 +246,3 @@ class SchoolReportGenerator:
         doc.build(elements, onFirstPage=self._draw_watermark, onLaterPages=self._draw_watermark)
         buffer.seek(0)
         return buffer
-    def generate_student_report_card(self, student_data, results_data, session_info, form_teacher_remark: str):
-        buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=inch, leftMargin=inch, topMargin=inch, bottomMargin=inch)
-        elements = []
-        self._add_header_and_student_info(elements, "STUDENT REPORT CARD", student_data, session_info)
-        elements.append(Paragraph("ACADEMIC PERFORMANCE", self.styles['GradeHeader']))
-        table_data = [['Subject', 'CA1', 'CA2', 'Exam', 'Total', 'Grade', 'Remark']]
-        total_score, count = 0, 0
-        for res in results_data['subjects']:
-            table_data.append([res['subject_name'], res['ca1'] or '-', res['ca2'] or '-', res['exam'] or '-', res['total'] or '-', res['grade_letter'] or '-', res['remark'] or '-'])
-            if res['total'] is not None:
-                total_score += res['total']
-                count += 1
-        average = total_score / count if count else 0
-        table = Table(table_data, colWidths=[2.5*inch, 0.6*inch, 0.6*inch, 0.6*inch, 0.6*inch, 0.6*inch, 1.3*inch])
-        table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.darkblue), ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), ('ALIGN', (1, 0), (-1, -1), 'CENTER'), ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black), ('BOX', (0, 0), (-1, -1), 0.25, colors.black), ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])]))
-        elements.append(table)
-        elements.append(Paragraph(f"<b>Term Average:</b> {average:.2f}%", self.styles['Normal']))
-        elements.append(Paragraph("FORM TEACHER'S REMARK", self.styles['GradeHeader']))
-        elements.append(Paragraph(form_teacher_remark, self.styles['Normal']))
-        doc.build(elements)
-        buffer.seek(0)
-        return buffer
-
-    # services/pdf_service.py -> class PDFReportService
-
-    def _get_student_cumulative_session_data(self, student_id: str, session_id: str, db_session: Session, user_role: UserRole):
-        # --- Step 1 & 2: Base Info & Security Check (No Changes) ---
-        student = db_session.get(User, student_id)
-        if not student: raise HTTPException(status_code=404, detail="Student not found")
-        student_profile = db_session.exec(select(StudentProfile).where(StudentProfile.user_id == student_id)).first()
-        academic_session = db_session.get(AcademicSession, session_id)
-        if not academic_session: raise HTTPException(status_code=404, detail="Academic session not found")
-        
-        terms_in_session = db_session.exec(select(Term).where(Term.session_id == session_id)).all()
-        term_map = {term.name: term for term in terms_in_session}
-        if not all(t in term_map for t in [TermName.first, TermName.second, TermName.third]):
-            raise HTTPException(status_code=400, detail="All three terms are required to generate a cumulative report.")
-        
-        # --- AFTER ---
-        third_term_obj = term_map[TermName.third] # We still need this for later use
-
-        # The query is now based on the session_id and checks if the enrollment is active
-        enrollment = db_session.exec(select(Enrollment).where(and_(
-            Enrollment.student_id == student_id,
-            Enrollment.session_id == session_id
-        ))).first()
-
-        if not enrollment:
-            # The error message is now more accurate
-            raise HTTPException(status_code=404, detail="Active student enrollment for this session not found.")
-
-        class_obj = db_session.get(Class, enrollment.class_id)
-
-        if user_role == UserRole.student:
-            third_term_published_check = db_session.exec(select(Result).where(and_(Result.student_id == student_id, Result.term_id == third_term_obj.id, Result.is_published == True))).first()
-            if not third_term_published_check:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cumulative report is not available until Third Term results are published.")
-
-        # --- Step 3 & 4: Fetch Results & Calculate Ranks (No Changes) ---
-        student_session_results = db_session.exec(select(Result).where(and_(Result.student_id == student_id, Result.session_id == session_id))).all()
-        all_class_third_term_results = db_session.exec(select(Result).where(and_(Result.class_id == class_obj.id, Result.term_id == third_term_obj.id))).all()
-
-        results_by_subject = defaultdict(list)
-        for res in all_class_third_term_results:
-            if res.total is not None:
-                results_by_subject[res.subject_id].append({'student_id': res.student_id, 'total': res.total})
-        
-        subject_averages = {sub_id: sum(s['total'] for s in scores) / len(scores) for sub_id, scores in results_by_subject.items() if scores}
-        subject_ranks = defaultdict(dict)
-        for sub_id, scores in results_by_subject.items():
-            sorted_scores = sorted(scores, key=lambda x: x['total'], reverse=True)
-            for rank, score_data in enumerate(sorted_scores, 1):
-                suf = 'th' if 11 <= rank <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(rank % 10, 'th')
-                subject_ranks[sub_id][score_data['student_id']] = f"{rank}{suf}"
-
-        # --- Step 5: Process Student's Data into Final Structure ---
-        subjects_data = {}
-        term_id_to_name_map = {term.id: term.name for term in terms_in_session}
-        for res in student_session_results:
-            if res.subject_id not in subjects_data:
-                subject_obj = db_session.get(Subject, res.subject_id)
-                # --- FIX: Initialize all keys with default values ---
-                subjects_data[res.subject_id] = {
-                    "subject_name": subject_obj.name, 
-                    TermName.first: 0.0, TermName.second: 0.0, TermName.third: 0.0,
-                    'ca1': '-', 'ca2': '-', 'exam': '-', 'total': '-' # Add placeholders
-                }
-            
-            term_name = term_id_to_name_map.get(res.term_id)
-            if term_name and res.total is not None:
-                subjects_data[res.subject_id][term_name] = res.total
-            
-            if res.term_id == third_term_obj.id:
-                subjects_data[res.subject_id]['ca1'] = res.ca1 if res.ca1 is not None else '-'
-                subjects_data[res.subject_id]['ca2'] = res.ca2 if res.ca2 is not None else '-'
-                subjects_data[res.subject_id]['exam'] = res.exam if res.exam is not None else '-'
-                subjects_data[res.subject_id]['total'] = res.total if res.total is not None else '-'
-
-        # --- Step 6: Final Calculations & Remarks (with small improvements) ---
-        final_cumulative_results = []
-        total_of_cumulative_scores = 0.0
-        for subject_id, subject_info in subjects_data.items():
-            cumulative_total = (subject_info[TermName.first] * 0.20) + (subject_info[TermName.second] * 0.30) + (subject_info[TermName.third] * 0.50)
-            final_grade, _ = calculate_detailed_grade(cumulative_total)
-            total_of_cumulative_scores += cumulative_total
-            
-            final_cumulative_results.append({
-                **subject_info,
-                "cumulative_total": cumulative_total,
-                "final_grade": final_grade,
-                "class_average": subject_averages.get(subject_id, 0.0),
-                "subject_position": subject_ranks.get(subject_id, {}).get(student_id, 'N/A')
-            })
-
-        overall_cumulative_average = total_of_cumulative_scores / len(final_cumulative_results) if final_cumulative_results else 0.0
-        remark_obj = db_session.exec(select(FormTeacherRemark).where(and_(FormTeacherRemark.student_id == student_id, FormTeacherRemark.term_id == third_term_obj.id))).first()
-        form_teacher_remark = remark_obj.remark_text if remark_obj else "No final remark provided."
-
-        principal_remark = "Graduated"
-        current_class_name = class_obj.name.upper()
-        if "SS3" in current_class_name:
-            principal_remark = "Graduated and certified."
-        elif "JSS3" in current_class_name:
-            principal_remark = "Promoted to SS1"
-        else:
-            match = re.search(r'\d+', current_class_name)
-            if match:
-                current_level = int(match.group())
-                next_level = current_level + 1
-                # --- FIX: Simplified and more robust class name replacement ---
-                next_class_name = re.sub(r'\d+', str(next_level), current_class_name.split(' ')[0])
-                principal_remark = f"Promoted to {next_class_name}"
-
-        principal_info = {
-            "name": "OMADA DAVID MR.",
-            "title": "DIRECTOR/PRINCIPAL"
-        }
-
-        # --- Step 7: Assemble Final Data Payload (No Changes) ---
-        student_data = {
-            'student_name': f"{student.first_name} {student.last_name}",
-            'admission_number': student_profile.admission_number if student_profile else "N/A",
-            'username': student.username,
-            'gender': student.gender.value,
-            'email': student.email,
-            'phone': student.phone,
-            'profile_picture_url': student.profile_picture_url
-        }
-        session_info = {'session_name': academic_session.name, 'class_name': class_obj.name}
-        
-        grade_counts = Counter(res['final_grade'] for res in final_cumulative_results if res['final_grade'])
-        grades_summary = ", ".join([f"{count}({grade})" for grade, count in sorted(grade_counts.items())])
-
-        return (
-            student_data, session_info, final_cumulative_results, overall_cumulative_average, 
-            form_teacher_remark, principal_remark, principal_info, grades_summary, class_obj
-        )
