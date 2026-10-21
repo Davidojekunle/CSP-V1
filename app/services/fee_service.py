@@ -10,7 +10,7 @@ from sqlalchemy import func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, and_
 
-from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, TargetType, InvoiceStatus, Payment
+from app.models import Fee, FeeAssignment, AcademicSession, Term, Class, User, Invoice, InvoiceItem, Enrollment, TargetType, InvoiceStatus, Payment, StudentProfile
 from app.models.base import PaymentStatus
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeAssignmentCreate
 
@@ -81,9 +81,21 @@ def parse_date(date_string: str) -> date:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
-    due_date = parse_date(req['due_date']) # Assuming _parse_date exists
-    
+def _applicable_fees(enrollment, fee_assignments, fees_map) -> list:
+    """Fees that apply to one enrollment: school-wide, its class, or the student specifically."""
+    applicable = []
+    for assign in fee_assignments:
+        fee = fees_map.get(assign.fee_id)
+        if not fee: continue
+        if (assign.target_type == TargetType.school or
+           (assign.target_type == TargetType.class_ and assign.target_id == enrollment.class_id) or
+           (assign.target_type == TargetType.student and assign.target_id == enrollment.student_id)):
+            applicable.append(fee)
+    return applicable
+
+
+async def _load_generation_context(req: dict, db: AsyncSession) -> dict:
+    """Everything invoice generation (and its preview) needs, loaded with a fixed number of queries."""
     # 1. Get all relevant fee assignments and fees
     result = await db.execute(select(FeeAssignment).where(
         FeeAssignment.session_id == req['session_id'], FeeAssignment.term_id == req['term_id']
@@ -91,7 +103,7 @@ async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
     fee_assignments = result.scalars().all()
     if not fee_assignments:
         raise HTTPException(status_code=404, detail="No fee assignments found for this term.")
-    
+
     fee_ids = {fa.fee_id for fa in fee_assignments}
     result = await db.execute(select(Fee).where(Fee.id.in_(list(fee_ids)), Fee.is_active == True))
     fees_map = {fee.id: fee for fee in result.scalars().all()}
@@ -101,16 +113,16 @@ async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
         Enrollment.session_id == req['session_id'], Enrollment.is_active == True
     )
     if req['scope'] == 'classes':
-        enrollment_query = enrollment_query.where(Enrollment.class_id.in_(req['target_ids']))
+        enrollment_query = enrollment_query.where(Enrollment.class_id.in_(req['target_ids'] or []))
     elif req['scope'] == 'students':
-        enrollment_query = enrollment_query.where(Enrollment.student_id.in_(req['target_ids']))
-    
+        enrollment_query = enrollment_query.where(Enrollment.student_id.in_(req['target_ids'] or []))
+
     result = await db.execute(enrollment_query)
     enrollments = result.scalars().all()
     if not enrollments:
-        raise HTTPException(status_code=404, detail=f"No active enrollments found for the scope.")
+        raise HTTPException(status_code=404, detail="No active enrollments found for the scope.")
 
-    # Prefetch existing invoices and their items for everyone in scope (2 queries instead of 2 per student)
+    # 3. Existing invoices and their items for everyone in scope
     student_ids = list({e.student_id for e in enrollments})
     existing_invoices = {}
     for inv in (await db.execute(select(Invoice).where(
@@ -126,19 +138,20 @@ async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
         ))).scalars().all():
             existing_fee_ids[item.invoice_id].add(item.fee_id)
 
+    return {"fee_assignments": fee_assignments, "fees_map": fees_map, "enrollments": enrollments,
+            "existing_invoices": existing_invoices, "existing_fee_ids": existing_fee_ids}
+
+
+async def generate_invoices_for_term(req: dict, db: AsyncSession) -> dict:
+    due_date = parse_date(req['due_date'])
+    ctx = await _load_generation_context(req, db)
+    fee_assignments, fees_map, enrollments = ctx["fee_assignments"], ctx["fees_map"], ctx["enrollments"]
+    existing_invoices, existing_fee_ids = ctx["existing_invoices"], ctx["existing_fee_ids"]
+
     created_count, updated_count = 0, 0
 
     for enrollment in enrollments:
-        # Determine applicable fees for this student
-        applicable_fees = []
-        for assign in fee_assignments:
-            fee = fees_map.get(assign.fee_id)
-            if not fee: continue
-            if (assign.target_type == TargetType.school or
-               (assign.target_type == TargetType.class_ and assign.target_id == enrollment.class_id) or
-               (assign.target_type == TargetType.student and assign.target_id == enrollment.student_id)):
-                applicable_fees.append(fee)
-
+        applicable_fees = _applicable_fees(enrollment, fee_assignments, fees_map)
         if not applicable_fees: continue
 
         existing_invoice = existing_invoices.get(enrollment.student_id)
@@ -417,3 +430,89 @@ async def _build_invoice_responses_bulk(invoices: List[Invoice], db: AsyncSessio
             "payments": payments_map.get(inv.id, [])
         })
     return response_list
+
+
+async def preview_invoice_generation(req: dict, db: AsyncSession) -> dict:
+    """What generate_invoices_for_term would do, without writing anything."""
+    parse_date(req['due_date'])
+    ctx = await _load_generation_context(req, db)
+    existing_invoices, existing_fee_ids = ctx["existing_invoices"], ctx["existing_fee_ids"]
+
+    seen, affected, to_create, total = set(), [], 0, 0.0
+    for enrollment in ctx["enrollments"]:
+        if enrollment.student_id in seen: continue
+        seen.add(enrollment.student_id)
+        fees = _applicable_fees(enrollment, ctx["fee_assignments"], ctx["fees_map"])
+        if not fees: continue
+        invoice = existing_invoices.get(enrollment.student_id)
+        if invoice is None:
+            to_create += 1
+            total += sum(f.amount for f in fees)
+        else:
+            if invoice.status == InvoiceStatus.cancelled: continue
+            missing = [f for f in fees if f.id not in existing_fee_ids[invoice.id]]
+            if not missing: continue
+            total += sum(f.amount for f in missing)
+        affected.append(enrollment.student_id)
+
+    sample_ids = affected[:5]
+    users = {u.id: u for u in (await db.execute(select(User).where(User.id.in_(sample_ids)))).scalars().all()} if sample_ids else {}
+    admissions = dict((await db.execute(
+        select(StudentProfile.user_id, StudentProfile.admission_number).where(StudentProfile.user_id.in_(sample_ids))
+    )).all()) if sample_ids else {}
+    return {
+        "students_to_invoice": len(affected),
+        "invoices_to_create": to_create,
+        "estimated_total_amount": total,
+        "sample_students": [
+            {"id": sid, "name": f"{users[sid].first_name} {users[sid].last_name}" if sid in users else "Unknown",
+             "admission_number": admissions.get(sid, "N/A")}
+            for sid in sample_ids
+        ],
+    }
+
+
+REPORT_STATUS_FILTERS = {
+    "paid": [InvoiceStatus.paid],
+    "partial": [InvoiceStatus.partial],
+    "unpaid": [InvoiceStatus.issued, InvoiceStatus.overdue, InvoiceStatus.draft],
+}
+
+
+async def get_invoice_report_rows(payment_status: str, db: AsyncSession) -> List[dict]:
+    """Rows for the invoice report download; payment_status is all | paid | partial | unpaid."""
+    await _update_overdue_invoices(db)
+    query = (
+        select(Invoice, User, StudentProfile.admission_number, AcademicSession.name, Term.name)
+        .join(User, Invoice.student_id == User.id)
+        .outerjoin(StudentProfile, StudentProfile.user_id == Invoice.student_id)
+        .join(AcademicSession, Invoice.session_id == AcademicSession.id)
+        .join(Term, Invoice.term_id == Term.id)
+    )
+    statuses = REPORT_STATUS_FILTERS.get(payment_status)
+    if statuses:
+        query = query.where(Invoice.status.in_(statuses))
+    elif payment_status != "all":
+        raise HTTPException(status_code=400, detail="payment_status must be one of: all, paid, partial, unpaid")
+    rows = (await db.execute(query.order_by(AcademicSession.start_date.desc(), User.last_name, User.first_name, Invoice.id))).all()
+    return [{
+        "Invoice Number": inv.invoice_number,
+        "Student": f"{user.first_name} {user.last_name}",
+        "Admission Number": admission or "N/A",
+        "Session": session_name,
+        "Term": term_name.value if hasattr(term_name, "value") else term_name,
+        "Total (NGN)": inv.total_amount,
+        "Paid (NGN)": inv.paid_amount,
+        "Balance (NGN)": inv.balance_due,
+        "Status": inv.status.value,
+        "Due Date": inv.due_date.isoformat() if inv.due_date else "",
+    } for inv, user, admission, session_name, term_name in rows]
+
+
+async def delete_fee_assignment(assignment_id: str, db: AsyncSession):
+    """Removes a fee assignment. Invoices already generated from it are not changed."""
+    assignment = await db.get(FeeAssignment, assignment_id)
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Fee assignment not found")
+    await db.delete(assignment)
+    await db.commit()

@@ -103,6 +103,21 @@ async def build_result_response(result: Result, session: AsyncSession) -> Result
         remark=result.remark
     )
 
+async def update_single_result(result_id: str, scores: dict, db: AsyncSession) -> Result:
+    """Updates CA1/CA2/exam for one result and recalculates total, grade and remark."""
+    result = await db.get(Result, result_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+    for field in ("ca1", "ca2", "exam"):
+        if field in scores:
+            setattr(result, field, scores[field])
+    result.total = _calculate_total(result.ca1, result.ca2, result.exam)
+    result.grade_letter, result.remark = calculate_detailed_grade(result.total) if result.total is not None else (None, None)
+    db.add(result)
+    await db.commit()
+    return result
+
+
 async def delete_result(result_id: str, db: AsyncSession):
     result = await db.get(Result, result_id)
     if not result:

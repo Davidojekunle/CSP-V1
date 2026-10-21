@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import List
 
 from app.core.database import get_session
 from app.core.auth import get_current_staff
-from app.models import User, AcademicSession, Term
+from app.models import User, AcademicSession, Term, BehavioralTraits
 from app.schemas.staff import  StaffProfileUpdate, StaffStudentResponse, StaffResultResponse, FormClassOverviewResponse, BehavioralTraitsCreate, BehavioralTraitsResponse # Add other schemas
 from app.schemas.dashboard import StudentDashboardResponse, StaffClassResponse, StaffDashboardStatsResponse, StaffDashboardResponse
 from app.schemas.user import UserResponse
@@ -116,3 +116,21 @@ async def create_or_update_traits(
 ):
     traits = await staff_service.create_or_update_behavioral_traits(staff_user=current_user, traits_data=traits_data, db=db)
     return traits
+
+
+@traits_router.get("/student/{student_id}")
+async def get_student_traits(
+    student_id: str,
+    session_id: str = Query(...),
+    term_id: str = Query(...),
+    db: AsyncSession = Depends(get_session)
+):
+    """Saved behavioural traits for a student/term; an empty object if none were recorded yet."""
+    traits = (await db.execute(select(BehavioralTraits).where(
+        BehavioralTraits.student_id == student_id,
+        BehavioralTraits.session_id == session_id,
+        BehavioralTraits.term_id == term_id,
+    ))).scalars().first()
+    if not traits:
+        return {}
+    return BehavioralTraitsResponse.model_validate(traits, from_attributes=True)

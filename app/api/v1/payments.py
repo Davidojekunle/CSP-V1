@@ -72,6 +72,12 @@ async def record_manual_payment(
     return {"message": "Manual payment recorded successfully", "payment_id": payment.id}
 
 
+@router.post("/fees/admin/verify-payment/{payment_id}")
+async def verify_payment(payment_id: str, current_admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_session)):
+    """Re-check a pending Paystack payment directly with Paystack."""
+    return await payment_service.verify_pending_payment(payment_id, db)
+
+
 @router.post("/fees/webhooks/paystack")
 async def paystack_webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()

@@ -10,7 +10,7 @@ from datetime import datetime, date
 
 from typing import Tuple
 from app.models import (
-    AcademicSession, Term, TermName, Class, Subject, ClassSubject, User, UserRole, Enrollment, StudentProfile
+    AcademicSession, Term, TermName, Class, Subject, ClassSubject, User, UserRole, Enrollment, StudentProfile, Result
 )
 from app.schemas.academic import (
     AcademicSessionCreate, AcademicSessionUpdate, TermCreate, TermUpdate,
@@ -375,3 +375,116 @@ async def get_all_class_subject_assignments(db: AsyncSession, class_id: Optional
         } for cs, c, s, u in results
     ]
 # ... We will add more service functions for update, delete, etc. as we go.
+
+
+# --- Updates / deletes used by the dashboard's edit forms ---
+
+async def set_current_session(session_id: str, db: AsyncSession) -> AcademicSession:
+    """Makes a session current. Terms of other sessions stop being current."""
+    academic_session = await db.get(AcademicSession, session_id)
+    if not academic_session:
+        raise HTTPException(status_code=404, detail="Academic session not found")
+    for s in (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True, AcademicSession.id != session_id))).scalars().all():
+        s.is_current = False
+        db.add(s)
+    for t in (await db.execute(select(Term).where(Term.is_current == True, Term.session_id != session_id))).scalars().all():
+        t.is_current = False
+        db.add(t)
+    academic_session.is_current = True
+    db.add(academic_session)
+    await db.commit()
+    return academic_session
+
+
+async def update_term(term_id: str, update_data: TermUpdate, db: AsyncSession) -> Tuple[Term, AcademicSession]:
+    term = await db.get(Term, term_id)
+    if not term:
+        raise HTTPException(status_code=404, detail="Term not found")
+    academic_session = await db.get(AcademicSession, term.session_id)
+    update_dict = update_data.model_dump(exclude_unset=True)
+
+    if "name" in update_dict and update_dict["name"] != term.name:
+        if (await db.execute(select(Term).where(Term.session_id == term.session_id, Term.name == update_dict["name"], Term.id != term_id))).scalars().first():
+            raise HTTPException(status_code=400, detail="Term already exists in this session")
+        term.name = update_dict["name"]
+    if update_dict.get("start_date"):
+        term.start_date = _parse_date(update_dict["start_date"])
+    if update_dict.get("end_date"):
+        term.end_date = _parse_date(update_dict["end_date"])
+    _validate_date_range(term.start_date, term.end_date)
+    if not (academic_session.start_date <= term.start_date and term.end_date <= academic_session.end_date):
+        raise HTTPException(status_code=400, detail="Term dates must be within the academic session's date range.")
+
+    db.add(term)
+    await db.commit()
+    if update_dict.get("is_current"):
+        term, academic_session = await set_current_term_and_session(term_id, db)
+    return term, academic_session
+
+
+async def update_class(class_id: str, update_data: ClassUpdate, db: AsyncSession) -> dict:
+    class_obj = await db.get(Class, class_id)
+    if not class_obj:
+        raise HTTPException(status_code=404, detail="Class not found")
+    update_dict = update_data.model_dump(exclude_unset=True)
+
+    if "name" in update_dict and update_dict["name"] != class_obj.name:
+        if (await db.execute(select(Class).where(Class.name == update_dict["name"], Class.id != class_id))).scalars().first():
+            raise HTTPException(status_code=400, detail="Class name already exists")
+    if update_dict.get("form_teacher_id"):
+        teacher = await db.get(User, update_dict["form_teacher_id"])
+        if not teacher or teacher.role not in [UserRole.staff, UserRole.admin]:
+            raise HTTPException(status_code=404, detail="Valid form teacher not found")
+
+    for field, value in update_dict.items():
+        setattr(class_obj, field, value)
+    db.add(class_obj)
+    await db.commit()
+
+    teacher = await db.get(User, class_obj.form_teacher_id) if class_obj.form_teacher_id else None
+    current_session = (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))).scalars().first()
+    students_count = 0
+    if current_session:
+        students_count = (await db.execute(select(func.count(Enrollment.id)).where(
+            Enrollment.class_id == class_id, Enrollment.session_id == current_session.id, Enrollment.is_active == True
+        ))).scalar_one()
+    subjects_count = (await db.execute(select(func.count(ClassSubject.id)).where(ClassSubject.class_id == class_id))).scalar_one()
+    return {
+        "id": class_obj.id, "name": class_obj.name, "level": class_obj.level, "arm": class_obj.arm,
+        "form_teacher_id": class_obj.form_teacher_id,
+        "form_teacher_name": f"{teacher.first_name} {teacher.last_name}" if teacher else None,
+        "is_active": class_obj.is_active, "promotion_type": class_obj.promotion_type,
+        "students_count": students_count, "subjects_count": subjects_count,
+    }
+
+
+async def update_subject(subject_id: str, update_data: SubjectUpdate, db: AsyncSession) -> dict:
+    subject = await db.get(Subject, subject_id)
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    update_dict = update_data.model_dump(exclude_unset=True)
+    if update_dict.get("code"):
+        update_dict["code"] = update_dict["code"].upper()
+        if update_dict["code"] != subject.code and (await db.execute(
+            select(Subject).where(Subject.code == update_dict["code"], Subject.id != subject_id)
+        )).scalars().first():
+            raise HTTPException(status_code=400, detail="Subject code already exists")
+    for field, value in update_dict.items():
+        setattr(subject, field, value)
+    db.add(subject)
+    await db.commit()
+    classes_count = (await db.execute(select(func.count(ClassSubject.id)).where(ClassSubject.subject_id == subject_id))).scalar_one()
+    return {"id": subject.id, "code": subject.code, "name": subject.name, "is_active": subject.is_active, "classes_count": classes_count}
+
+
+async def delete_subject(subject_id: str, db: AsyncSession):
+    """Deletes a subject that has never been used; subjects with results or class assignments must be deactivated instead."""
+    subject = await db.get(Subject, subject_id)
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    in_use = (await db.execute(select(ClassSubject.id).where(ClassSubject.subject_id == subject_id).limit(1))).first() or \
+        (await db.execute(select(Result.id).where(Result.subject_id == subject_id).limit(1))).first()
+    if in_use:
+        raise HTTPException(status_code=400, detail="Subject is assigned to classes or has results. Deactivate it instead of deleting.")
+    await db.delete(subject)
+    await db.commit()
