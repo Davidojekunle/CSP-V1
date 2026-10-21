@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.engine import make_url
 from sqlmodel import select
 
 from app.core.config import settings
@@ -34,6 +35,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.is_production and settings.is_sqlite:
+        # Without DATABASE_URL the app falls back to an empty local SQLite file; every
+        # request would fail while health checks still pass. Refuse to start instead.
+        raise RuntimeError(
+            "ENVIRONMENT=production but DATABASE_URL is not set (falling back to SQLite). "
+            "Set DATABASE_URL to the Supabase connection string in the host's environment variables."
+        )
+    db_url = make_url(settings.async_database_url)
+    logger.info("Database: %s on %s:%s", db_url.get_backend_name(), db_url.host or "local file", db_url.port or "-")
     if settings.AUTO_CREATE_TABLES:
         await create_db_and_tables()
     if settings.SEED_SAMPLE_DATA:
