@@ -119,6 +119,66 @@ async def initialize_student_payment(
     }
 
 
+async def _settle_paystack_payment(payment: Payment, db: AsyncSession) -> Optional[Invoice]:
+    """
+    Re-verifies a pending Paystack payment and, if Paystack confirms the full
+    expected amount, marks it successful and applies it to the invoice.
+    Returns the updated invoice, or None if verification failed (payment marked failed).
+    Raises httpx.HTTPError if Paystack could not be reached (payment left pending).
+    The caller must hold a row lock on the payment and commit.
+    """
+    verification = await paystack_service.verify_transaction(payment.paystack_reference)
+    data = verification.get("data") or {}
+    expected_kobo = int(round(payment.amount * 100))
+    if not verification.get("status") or data.get("status") != "success" or data.get("amount") != expected_kobo:
+        logger.warning("Paystack verification failed for %s (status=%s, amount=%s, expected=%s)",
+                       payment.paystack_reference, data.get("status"), data.get("amount"), expected_kobo)
+        payment.status = PaymentStatus.failed
+        payment.paystack_response = json.dumps(verification)
+        payment.updated_at = datetime.utcnow()
+        db.add(payment)
+        return None
+
+    payment.status = PaymentStatus.successful
+    payment.paystack_response = json.dumps(data)
+    payment.gateway_response = data.get("gateway_response")
+    channel = data.get("channel")
+    try:
+        payment.payment_method = PaymentMethod(channel) if channel else None
+    except ValueError:
+        payment.payment_method = None  # Unknown channel; raw value is kept in paystack_response
+    payment.paid_at = datetime.utcnow()
+    payment.updated_at = datetime.utcnow()
+    db.add(payment)
+
+    invoice = await _get_invoice_for_update(payment.invoice_id, db)
+    if not invoice:
+        logger.critical("Invoice %s not found for payment %s", payment.invoice_id, payment.id)
+        return None
+    _apply_payment_to_invoice(invoice, payment.amount, db)
+    return invoice
+
+
+async def _send_receipt(payment: Payment, invoice: Invoice, db: AsyncSession):
+    try:
+        student = await db.get(User, invoice.student_id)
+        if student and student.email:
+            pdf_buffer = await invoice_pdf_service.generate_invoice_pdf(invoice.id, db)
+            await send_payment_receipt_email(
+                recipient_email=student.email,
+                student_name=student.first_name,
+                receipt_details={
+                    'invoice_number': invoice.invoice_number,
+                    'amount_paid_this_time': payment.amount,
+                    'paid_amount': invoice.paid_amount,
+                    'balance_due': invoice.balance_due
+                },
+                pdf_attachment_bytes=pdf_buffer.getvalue()
+            )
+    except Exception:
+        logger.exception("Failed to send receipt for payment %s", payment.paystack_reference)
+
+
 async def process_successful_webhook_payment(webhook_data: dict):
     """
     Processes a 'charge.success' event from a Paystack webhook.
@@ -137,67 +197,38 @@ async def process_successful_webhook_payment(webhook_data: dict):
         if not payment or payment.status == PaymentStatus.successful:
             logger.info("Webhook: payment not found or already processed for %s", reference)
             return
-
-        # Security: Always re-verify the transaction with Paystack's API
         try:
-            verification = await paystack_service.verify_transaction(reference)
+            invoice = await _settle_paystack_payment(payment, db)
         except httpx.HTTPError as e:
             # Leave it pending; Paystack retries webhooks that don't succeed
             logger.error("Paystack verify failed for %s: %s", reference, e)
             raise
-
-        data = verification.get("data") or {}
-        expected_kobo = int(round(payment.amount * 100))
-        if not verification.get("status") or data.get("status") != "success" or data.get("amount") != expected_kobo:
-            logger.warning("Webhook: verification failed for %s (status=%s, amount=%s, expected=%s)",
-                           reference, data.get("status"), data.get("amount"), expected_kobo)
-            payment.status = PaymentStatus.failed
-            payment.paystack_response = json.dumps(verification)
-            db.add(payment)
-            await db.commit()
-            return
-
-        # 1. Update the Payment object
-        payment.status = PaymentStatus.successful
-        payment.paystack_response = json.dumps(data)
-        payment.gateway_response = data.get("gateway_response")
-        channel = data.get("channel")
-        try:
-            payment.payment_method = PaymentMethod(channel) if channel else None
-        except ValueError:
-            payment.payment_method = None  # Unknown channel; raw value is kept in paystack_response
-        payment.paid_at = datetime.utcnow()
-        payment.updated_at = datetime.utcnow()
-        db.add(payment)
-
-        # 2. Update the corresponding Invoice object
-        invoice = await _get_invoice_for_update(payment.invoice_id, db)
-        if not invoice:
-            logger.critical("Invoice %s not found for payment %s", payment.invoice_id, payment.id)
-            await db.commit()
-            return
-        _apply_payment_to_invoice(invoice, payment.amount, db)
         await db.commit()
-        logger.info("Webhook: payment %s processed", reference)
+        if invoice:
+            logger.info("Webhook: payment %s processed", reference)
+            await _send_receipt(payment, invoice, db)
 
-        # 3. Send receipt
-        try:
-            student = await db.get(User, invoice.student_id)
-            if student and student.email:
-                pdf_buffer = await invoice_pdf_service.generate_invoice_pdf(invoice.id, db)
-                await send_payment_receipt_email(
-                    recipient_email=student.email,
-                    student_name=student.first_name,
-                    receipt_details={
-                        'invoice_number': invoice.invoice_number,
-                        'amount_paid_this_time': payment.amount,
-                        'paid_amount': invoice.paid_amount,
-                        'balance_due': invoice.balance_due
-                    },
-                    pdf_attachment_bytes=pdf_buffer.getvalue()
-                )
-        except Exception:
-            logger.exception("Failed to send receipt for payment %s", reference)
+
+async def verify_pending_payment(payment_id: str, db: AsyncSession) -> dict:
+    """Admin action: re-check a Paystack payment with Paystack (e.g. when a webhook was missed)."""
+    payment = (await db.execute(select(Payment).where(Payment.id == payment_id).with_for_update())).scalars().first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if payment.status == PaymentStatus.successful:
+        return {"message": "Payment is already verified.", "status": payment.status.value}
+    if payment.paystack_reference.startswith("MANUAL_"):
+        raise HTTPException(status_code=400, detail="Manual payments are not verified with Paystack.")
+    try:
+        invoice = await _settle_paystack_payment(payment, db)
+    except httpx.HTTPError as e:
+        logger.error("Paystack verify failed for %s: %s", payment.paystack_reference, e)
+        raise HTTPException(status_code=502, detail="Could not reach Paystack. Try again shortly.")
+    await db.commit()
+    if not invoice:
+        raise HTTPException(status_code=400, detail="Paystack did not confirm this payment. It has been marked as failed.")
+    await _send_receipt(payment, invoice, db)
+    return {"message": "Payment verified successfully.", "status": payment.status.value,
+            "invoice_status": invoice.status.value, "balance_due": invoice.balance_due}
 
 
 async def record_manual_payment(payment_data: ManualPaymentRequest, admin_user: User, db: AsyncSession) -> tuple[Payment, Invoice]:

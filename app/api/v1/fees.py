@@ -6,15 +6,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import List, Optional, Dict
 
-from app.models import ActivityAction, User, InvoiceStatus, Invoice, TargetType, UserRole, PaymentStatus
+from app.models import ActivityAction, User, InvoiceStatus, Invoice, TargetType, UserRole, PaymentStatus, InvoiceGenerationScope
 from app.core.database import get_session
 from app.core.auth import get_current_admin, get_current_active_user, get_current_student
 from app.schemas.payment import PaymentResponse, PaymentHistoryResponse
 from app.schemas.fee import FeeCreate, FeeUpdate, FeeResponse, FeeAssignmentCreate, InvoiceGenerateRequest, PaginatedInvoiceResponse, InvoiceResponse
 from app.services import fee_service, activity_log_service, payment_service
 from app.schemas.dashboard import FeeDashboardStats # We will create this schema
+from datetime import date
+
+from anyio.to_thread import run_sync
+from fastapi import Response
 from fastapi.responses import StreamingResponse
 from app.services.pdf.invoice import invoice_pdf_service
+from app.services.pdf import invoice_report
 
 router = APIRouter(
     prefix="/fees/admin", # PRESERVED: Matches original prefix="/fees" + "/admin"
@@ -48,6 +53,45 @@ async def update_fee(fee_id: str, fee_data: FeeUpdate, db: AsyncSession = Depend
 async def create_fee_assignment(assign_data: FeeAssignmentCreate, db: AsyncSession = Depends(get_session)):
     await fee_service.create_fee_assignment(assign_data, db)
     return {"message": "Fee assignment created successfully"}
+
+@router.delete("/fee-assignments/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_fee_assignment(assignment_id: str, db: AsyncSession = Depends(get_session)):
+    await fee_service.delete_fee_assignment(assignment_id, db)
+    return
+
+
+@router.get("/invoice-generation/preview")
+async def preview_invoice_generation(
+    session_id: str = Query(...), term_id: str = Query(...), due_date: str = Query(...),
+    scope: InvoiceGenerationScope = Query(InvoiceGenerationScope.school),
+    target_ids: Optional[str] = Query(None, description="Comma-separated class or student ids"),
+    db: AsyncSession = Depends(get_session)
+):
+    """Dry run of /generate-invoices: how many invoices would be created and for how much."""
+    ids = [t for t in (target_ids or "").split(",") if t]
+    return await fee_service.preview_invoice_generation(
+        {"session_id": session_id, "term_id": term_id, "due_date": due_date, "scope": scope.value, "target_ids": ids}, db
+    )
+
+
+@router.get("/invoice-report")
+async def download_invoice_report(
+    payment_status: str = Query("all"), file_type: str = Query("excel"),
+    db: AsyncSession = Depends(get_session)
+):
+    """Invoice report as Excel (file_type=excel) or PDF (file_type=pdf)."""
+    rows = await fee_service.get_invoice_report_rows(payment_status, db)
+    stamp = date.today().isoformat()
+    if file_type == "pdf":
+        content = await run_sync(invoice_report.render_pdf, rows, f"Invoice Report ({payment_status})")
+        media, filename = "application/pdf", f"invoice_report_{stamp}.pdf"
+    elif file_type == "excel":
+        content = await run_sync(invoice_report.render_xlsx, rows)
+        media, filename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"invoice_report_{stamp}.xlsx"
+    else:
+        raise HTTPException(status_code=400, detail="file_type must be 'excel' or 'pdf'")
+    return Response(content=content, media_type=media, headers={"Content-Disposition": f"attachment; filename={filename}"})
+
 
 @router.post("/generate-invoices")
 async def generate_invoices(
@@ -218,6 +262,24 @@ async def get_student_invoice_details(
 
     # Use the helper we already defined in this file to build the response
     return await _build_invoice_response(invoice, db)
+
+
+@student_router.get("/invoice/{invoice_id}/pdf")
+async def download_my_invoice_pdf(
+    invoice_id: str,
+    current_user_data: Dict = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_session)
+):
+    """Invoice/receipt PDF for the student who owns it (or any admin)."""
+    user, role = current_user_data["user"], current_user_data["user_type"]
+    invoice = await db.get(Invoice, invoice_id)
+    if not invoice or not (role == UserRole.admin or (role == UserRole.student and invoice.student_id == user.id)):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    pdf_buffer = await invoice_pdf_service.generate_invoice_pdf(invoice_id, db)
+    return StreamingResponse(
+        pdf_buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=invoice_{invoice.invoice_number}.pdf"}
+    )
 
 
 neutral_fee_router = APIRouter(prefix="/fees", tags=["Fee Management"])

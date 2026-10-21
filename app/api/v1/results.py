@@ -6,6 +6,8 @@ from sqlalchemy import update
 from sqlmodel import select
 from typing import List, Dict, Optional
 
+from pydantic import BaseModel, Field
+
 from app.core.database import get_session
 from app.core.auth import get_current_admin, get_current_staff_or_admin, get_current_active_user, get_current_staff
 from app.models import User, UserRole, Result, AcademicSession, Term
@@ -36,6 +38,38 @@ async def bulk_create_or_update_results(
         "updated": counts['updated'],
         "errors": [] 
     }
+
+
+class SingleResultUpdate(BaseModel):
+    ca1: Optional[float] = Field(None, ge=0)
+    ca2: Optional[float] = Field(None, ge=0)
+    exam: Optional[float] = Field(None, ge=0)
+
+
+@router.put("/{result_id}", dependencies=[Depends(get_current_staff_or_admin)])
+async def update_result(result_id: str, scores: SingleResultUpdate, db: AsyncSession = Depends(get_session)):
+    """Edit one student's scores; total, grade and remark are recalculated."""
+    result = await result_service.update_single_result(result_id, scores.model_dump(exclude_unset=True), db)
+    return {
+        "message": "Result updated successfully",
+        "id": result.id, "ca1": result.ca1, "ca2": result.ca2, "exam": result.exam,
+        "total": result.total, "grade_letter": result.grade_letter, "remark": result.remark,
+    }
+
+
+@router.get("/student/{student_id}/available-terms")
+async def get_student_available_terms(
+    student_id: str,
+    current_user_data: dict = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_session)
+):
+    """Sessions/terms in which a student has results (students: own, published only)."""
+    user = current_user_data["user"]
+    is_student = current_user_data["user_type"] == UserRole.student
+    if is_student and student_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only view your own results.")
+    terms = await result_service.get_student_available_terms(db, student_id, is_student)
+    return {"available_terms": terms}
 
 
 @router.delete("/{result_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(get_current_admin)])

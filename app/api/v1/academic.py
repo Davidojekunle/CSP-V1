@@ -51,6 +51,11 @@ async def update_academic_session(session_id: str, update_data: AcademicSessionU
         terms_count=terms_count
     )
 
+@router.post("/sessions/{session_id}/set-current", response_model=Dict[str, str])
+async def set_current_session(session_id: str, db: AsyncSession = Depends(get_session)):
+    academic_session = await academic_service.set_current_session(session_id, db)
+    return {"message": f"Session '{academic_session.name}' is now current."}
+
 # --- Terms ---
 @router.post("/terms", response_model=TermResponse, status_code=status.HTTP_201_CREATED)
 async def create_term(term_data: TermCreate, db: AsyncSession = Depends(get_session)):
@@ -71,6 +76,15 @@ async def set_current_term(term_id: str, db: AsyncSession = Depends(get_session)
     term, ac_session = await academic_service.set_current_term_and_session(term_id, db)
     return {"message": f"Term '{term.name.value}' in session '{ac_session.name}' is now current."}
 
+@router.put("/terms/{term_id}", response_model=TermResponse)
+async def update_term(term_id: str, update_data: TermUpdate, db: AsyncSession = Depends(get_session)):
+    term, academic_session = await academic_service.update_term(term_id, update_data, db)
+    return TermResponse(
+        id=term.id, session_id=term.session_id, name=term.name,
+        start_date=str(term.start_date), end_date=str(term.end_date),
+        is_current=term.is_current, session_name=academic_session.name
+    )
+
 # --- Classes ---
 @router.post("/classes", response_model=ClassResponse, status_code=status.HTTP_201_CREATED)
 async def create_class(class_data: ClassCreate, db: AsyncSession = Depends(get_session)):
@@ -88,6 +102,10 @@ async def get_classes(is_active: Optional[bool] = Query(None), db: AsyncSession 
     classes_data = await academic_service.get_all_classes(db, is_active)
     return classes_data
 
+@router.put("/classes/{class_id}", response_model=ClassResponse)
+async def update_class(class_id: str, update_data: ClassUpdate, db: AsyncSession = Depends(get_session)):
+    return await academic_service.update_class(class_id, update_data, db)
+
 # --- Subjects ---
 @router.post("/subjects", response_model=SubjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_subject(subject_data: SubjectCreate, db: AsyncSession = Depends(get_session)):
@@ -101,6 +119,15 @@ async def create_subject(subject_data: SubjectCreate, db: AsyncSession = Depends
 async def get_subjects(is_active: Optional[bool] = Query(None), db: AsyncSession = Depends(get_session)):
     subjects_data = await academic_service.get_all_subjects(db, is_active)
     return subjects_data
+
+@router.put("/subjects/{subject_id}", response_model=SubjectResponse)
+async def update_subject(subject_id: str, update_data: SubjectUpdate, db: AsyncSession = Depends(get_session)):
+    return await academic_service.update_subject(subject_id, update_data, db)
+
+@router.delete("/subjects/{subject_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_subject(subject_id: str, db: AsyncSession = Depends(get_session)):
+    await academic_service.delete_subject(subject_id, db)
+    return
 
 # --- Class-Subject Assignments ---
 @router.post("/class-subjects", response_model=ClassSubjectResponse, status_code=status.HTTP_201_CREATED)
