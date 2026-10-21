@@ -159,6 +159,29 @@ def test_pay_endpoint_body_is_optional_and_returns_paystack_shape(client, school
     assert calls["amount"] == 5000.0
 
 
+def test_pay_endpoint_partial_amount_and_flat_fields_for_dashboard(client, school, session, monkeypatch):
+    """The dashboard sends {amount, callback_url} and reads authorization_url at the top level."""
+    s = school
+    inv = _invoice(session, s)
+    calls = {}
+
+    async def fake_initialize(email, amount, reference, callback_url, metadata):
+        calls.update(amount=amount, callback_url=callback_url)
+        return {"status": True, "message": "ok",
+                "data": {"authorization_url": "https://checkout.paystack.com/y", "access_code": "ac", "reference": reference}}
+
+    from app.services.payment.paystack import paystack_service
+    monkeypatch.setattr(paystack_service, "initialize_transaction", fake_initialize)
+
+    r = client.post(f"/fees/student/pay/{inv.id}", headers=auth_header(s["students"][0]),
+                    json={"invoice_id": inv.id, "amount": 1500, "callback_url": "https://app.example/cb"})
+    body = r.json()
+    assert r.status_code == 200
+    assert body["authorization_url"] == "https://checkout.paystack.com/y"
+    assert body["access_code"] == "ac" and body["reference"].startswith("PAY_")
+    assert calls == {"amount": 1500, "callback_url": "https://app.example/cb"}
+
+
 def test_manual_payment_updates_invoice(client, school, session):
     s = school
     inv = _invoice(session, s)

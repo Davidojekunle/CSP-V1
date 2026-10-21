@@ -1,5 +1,7 @@
-from pydantic import BaseModel, EmailStr
+from datetime import date
 from typing import Optional
+
+from pydantic import BaseModel, EmailStr
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -26,7 +28,10 @@ class TokenResponse(BaseModel):
 
 
 class UserProfileResponse(BaseModel):
-    """User profile response - PRESERVED: exact structure"""
+    """
+    User profile response. The first seven fields are the original contract; the
+    rest are what the dashboard's "My Profile" page displays.
+    """
     id: str
     email: str
     username: str
@@ -34,6 +39,14 @@ class UserProfileResponse(BaseModel):
     last_name: str
     role: str
     is_active: bool
+    middle_name: Optional[str] = None
+    phone: Optional[str] = None
+    gender: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    age: Optional[int] = None
+    profile_picture_url: Optional[str] = None
+    student_profile: Optional[dict] = None
+    staff_profile: Optional[dict] = None
 
 
 class MessageResponse(BaseModel):

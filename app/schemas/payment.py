@@ -25,11 +25,19 @@ class PaymentResponse(BaseModel):
 
 
 class PaymentHistoryResponse(BaseModel):
+    """Student payment history: PaymentResponse fields plus the original payment_id alias."""
     payment_id: str
     reference: str
     amount: float
-    paid_at: datetime
+    paid_at: Optional[datetime]
     invoice_id: str
+    id: str
+    invoice_number: str
+    student_name: str
+    status: PaymentStatus
+    payment_method: Optional[str]
+    created_at: Optional[datetime]
+    student_id: str
 
 class PaymentInitializeRequest(BaseModel):
     amount: Optional[float] = None  # If None, pay full balance
