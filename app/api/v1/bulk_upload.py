@@ -3,7 +3,7 @@
 New, refactored API routes for bulk data uploads.
 """
 from fastapi import APIRouter, Depends, UploadFile, File, BackgroundTasks, status
-from sqlmodel import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any
 
 from app.core.database import get_session
@@ -24,7 +24,7 @@ async def bulk_upload_students(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_admin: User = Depends(get_current_admin),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ) -> Dict[str, Any]:
     """
     Handles bulk upload of students from a CSV or Excel file.
@@ -46,7 +46,7 @@ async def bulk_upload_students(
     await activity_log_service.log_activity(
         session, current_admin, ActivityAction.USER_BULK_UPLOAD, log_details
     )
-    session.commit() # Commit the log entry
+    await session.commit() # Commit the log entry
 
     # 4. Return the result to the user
     # We remove email_tasks before sending the response as it's not part of the API contract.
@@ -58,7 +58,7 @@ async def bulk_upload_staff(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_admin: User = Depends(get_current_admin),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ) -> Dict[str, Any]:
     """
     Handles bulk upload of staff and admins from a CSV or Excel file.
@@ -79,7 +79,7 @@ async def bulk_upload_staff(
     await activity_log_service.log_activity(
         session, current_admin, ActivityAction.USER_BULK_UPLOAD, log_details
     )
-    session.commit()
+    await session.commit()
 
     # 4. Return the result to the user
     result.pop("email_tasks", None)

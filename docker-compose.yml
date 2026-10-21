@@ -1,0 +1,58 @@
+# docker-compose.yml
+#
+# Two ways to run:
+#   1. Against Supabase (production-like): set DATABASE_URL (and MIGRATION_DATABASE_URL)
+#      in .env, then `docker compose up api`
+#   2. Fully local with a Postgres container: `docker compose --profile local-db up`
+#      (DATABASE_URL defaults to the bundled db service)
+
+services:
+  # Local PostgreSQL (only started with --profile local-db)
+  db:
+    image: postgres:15-alpine
+    container_name: crowners_db
+    profiles: ["local-db"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-crowners}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-crowners}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Applies database migrations, then exits
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-crowners}}
+      - MIGRATION_DATABASE_URL=${MIGRATION_DATABASE_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false   # only waited on when the local-db profile is active
+
+  # The FastAPI application
+  api:
+    build: .
+    container_name: crowners_api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-crowners}}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

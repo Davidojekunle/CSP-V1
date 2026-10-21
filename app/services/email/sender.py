@@ -1,27 +1,49 @@
-from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
-from typing import List, Dict
-from pydantic import EmailStr
-
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import tempfile
+import logging
 import os
+import tempfile
+from functools import lru_cache
+from html import escape
+from typing import Dict, List, Optional
+
+from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+from pydantic import EmailStr
 
 from app.core.config import settings
 
-# Email configuration - PRESERVED from original
-conf = ConnectionConfig(
-    MAIL_USERNAME=settings.MAIL_USERNAME,
-    MAIL_PASSWORD=settings.MAIL_PASSWORD,
-    MAIL_FROM=settings.MAIL_FROM,
-    MAIL_PORT=settings.MAIL_PORT,
-    MAIL_SERVER=settings.MAIL_SERVER,
-    MAIL_STARTTLS=settings.MAIL_STARTTLS,
-    MAIL_SSL_TLS=settings.MAIL_SSL_TLS,
-    USE_CREDENTIALS=True,
-    VALIDATE_CERTS=True
-)
+logger = logging.getLogger(__name__)
+
+
+@lru_cache()
+def _mailer() -> Optional[FastMail]:
+    """Built lazily so the app can start without mail settings."""
+    if not settings.EMAIL_ENABLED:
+        return None
+    if not all([settings.MAIL_USERNAME, settings.MAIL_PASSWORD, settings.MAIL_FROM, settings.MAIL_SERVER]):
+        logger.warning("EMAIL_ENABLED is set but MAIL_* settings are incomplete; emails will not be sent.")
+        return None
+    return FastMail(ConnectionConfig(
+        MAIL_USERNAME=settings.MAIL_USERNAME,
+        MAIL_PASSWORD=settings.MAIL_PASSWORD,
+        MAIL_FROM=settings.MAIL_FROM,
+        MAIL_PORT=settings.MAIL_PORT,
+        MAIL_SERVER=settings.MAIL_SERVER,
+        MAIL_STARTTLS=settings.MAIL_STARTTLS,
+        MAIL_SSL_TLS=settings.MAIL_SSL_TLS,
+        USE_CREDENTIALS=True,
+        VALIDATE_CERTS=True
+    ))
+
+
+async def _send(message: MessageSchema, description: str):
+    fm = _mailer()
+    if fm is None:
+        logger.info("Email disabled; skipped %s", description)
+        return
+    try:
+        await fm.send_message(message)
+        logger.info("Sent %s", description)
+    except Exception:
+        logger.exception("Failed to send %s", description)
 
 
 async def send_password_reset_email(
@@ -29,41 +51,31 @@ async def send_password_reset_email(
     first_name: str,
     token: str
 ):
-    """
-    Send password reset email.
-    PRESERVED: Exact same HTML template and logic.
-    """
-    reset_link = f"http://yourappfrontend.com/reset-password?token={token}"
+    """Send password reset email."""
+    reset_link = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
     html = f"""
-    Hello {first_name},
+    Hello {escape(first_name or '')},
     Please use the following link to reset your password:
-    {reset_link}
-    This link will expire in 1 hour.
+    <a href="{reset_link}">{reset_link}</a>
+    This link will expire in 2 hours.
     """
-    
+
     message = MessageSchema(
         subject="Password Reset Request",
         recipients=email,
         body=html,
         subtype=MessageType.html
     )
-
-    fm = FastMail(conf)
-    await fm.send_message(message)
+    await _send(message, "password reset email")
 
 
 async def send_welcome_email(recipient_email: EmailStr, user_details: Dict):
     """
     Sends a welcome email to a new user with their credentials.
-    PRESERVED: The email content and structure are identical to the original.
     """
-    if not settings.EMAIL_ENABLED:
-        print(f"Email sending is disabled. Would send to {recipient_email}.")
-        return
-
-    first_name = user_details.get("first_name", "User")
-    username = user_details.get("username")
-    password = user_details.get("password")
+    first_name = escape(user_details.get("first_name", "User") or "User")
+    username = escape(str(user_details.get("username")))
+    password = escape(str(user_details.get("password")))
 
     html = f"""
     <html>
@@ -80,20 +92,14 @@ async def send_welcome_email(recipient_email: EmailStr, user_details: Dict):
         </body>
     </html>
     """
-    
+
     message = MessageSchema(
         subject="Welcome to Crowners Portal!",
         recipients=[recipient_email],
         body=html,
         subtype=MessageType.html
     )
-
-    fm = FastMail(conf)
-    try:
-        await fm.send_message(message)
-        print(f"Welcome email sent to {recipient_email}")
-    except Exception as e:
-        print(f"Failed to send welcome email to {recipient_email}: {e}")
+    await _send(message, "welcome email")
 
 
 async def send_result_notification_email(
@@ -104,16 +110,12 @@ async def send_result_notification_email(
     """
     Sends an email to a student notifying them that their results have been published.
     """
-    if not settings.EMAIL_ENABLED:
-        print(f"Email sending disabled. Would notify {recipient_email} about results.")
-        return
-
     html = f"""
     <html>
         <body>
-            <h2>Dear {student_name},</h2>
+            <h2>Dear {escape(student_name or '')},</h2>
             <p>
-                We are pleased to inform you that your results for <strong>{term_details}</strong>
+                We are pleased to inform you that your results for <strong>{escape(term_details or '')}</strong>
                 have been published.
             </p>
             <p>
@@ -123,20 +125,14 @@ async def send_result_notification_email(
         </body>
     </html>
     """
-    
+
     message = MessageSchema(
         subject="Your Results Have Been Published!",
         recipients=[recipient_email],
         body=html,
         subtype=MessageType.html
     )
-
-    fm = FastMail(conf)
-    try:
-        await fm.send_message(message)
-        print(f"Result notification sent to {recipient_email}")
-    except Exception as e:
-        print(f"Failed to send result notification to {recipient_email}: {e}")
+    await _send(message, "result notification")
 
 
 async def send_payment_receipt_email(
@@ -149,13 +145,13 @@ async def send_payment_receipt_email(
     Sends an email with a payment receipt and the invoice PDF attached,
     using a temporary file to comply with fastapi-mail's attachment requirements.
     """
-    if not settings.EMAIL_ENABLED:
-        print(f"Email sending disabled. Would send receipt to {recipient_email}.")
+    if _mailer() is None:
+        logger.info("Email disabled; skipped payment receipt")
         return
 
     html_body = f"""
     <html><body>
-        <h2>Dear {student_name},</h2>
+        <h2>Dear {escape(student_name or '')},</h2>
         <p>Thank you for your payment. Your payment has been successfully processed.</p>
         <h3>Payment Summary:</h3>
         <ul>
@@ -169,57 +165,38 @@ async def send_payment_receipt_email(
     </body></html>
     """
 
-    attachment_filename = f"Invoice_{receipt_details.get('invoice_number', 'receipt')}.pdf"
-
-    # --- THIS IS THE GUARANTEED FIX ---
-    # 1. Use a temporary file to write the PDF bytes to disk.
-    #    `delete=False` is crucial so the file is not deleted when the 'with' block exits.
+    # fastapi-mail attaches from a file path; delete=False so it survives the with-block
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
         tmp_file.write(pdf_attachment_bytes)
-        temp_file_path = tmp_file.name # Get the full path to the temporary file
+        temp_file_path = tmp_file.name
 
     try:
-        # 2. Construct the MessageSchema with the file path.
         message = MessageSchema(
             subject=f"Payment Receipt for Invoice {receipt_details.get('invoice_number', 'N/A')}",
             recipients=[recipient_email],
             body=html_body,
             subtype=MessageType.html,
-            attachments=[temp_file_path]  # <-- Pass the file path string in a list
+            attachments=[temp_file_path]
         )
-        
-        fm = FastMail(conf)
-        # 3. Send the message. fastapi-mail will read the file from the path.
-        await fm.send_message(message=message)
-        print(f"Payment receipt with PDF sent to {recipient_email}")
-
-    except Exception as e:
-        print(f"Failed to send receipt email to {recipient_email}. Error: {e}")
-        
+        await _send(message, "payment receipt")
     finally:
-        # 4. CRITICAL: Clean up the temporary file after sending is attempted.
-        #    This runs whether the email succeeded or failed.
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
 
-
-
-
-# Create a singleton instance for easy importing
 class EmailService:
     @staticmethod
     async def send_payment_receipt_email(*args, **kwargs):
         return await send_payment_receipt_email(*args, **kwargs)
-    
+
     @staticmethod
     async def send_welcome_email(*args, **kwargs):
         return await send_welcome_email(*args, **kwargs)
-    
+
     @staticmethod
     async def send_result_notification_email(*args, **kwargs):
         return await send_result_notification_email(*args, **kwargs)
 
 
+# Create a singleton instance for easy importing
 email_service = EmailService()
-

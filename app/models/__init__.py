@@ -19,6 +19,7 @@ from .result import BehavioralTraits, FormTeacherRemark, Result
 from .staff import StaffProfile
 from .student import StudentProfile
 from .user import User
+from . import indexes  # noqa: F401  (registers secondary indexes on the tables)
 
 # The __all__ variable defines the public API of the module.
 # When a user writes `from app.models import *`, this is the list of names

@@ -1,48 +1,45 @@
+# Pinned to the versions the app is tested against. Upgrade deliberately.
+
 # Core
-fastapi>=0.109
-uvicorn[standard]>=0.27
-python-multipart>=0.0.6
-fastapi-mail>=1.4.1
+fastapi==0.128.0
+uvicorn[standard]==0.40.0
+gunicorn==25.0.1
+python-multipart==0.0.22
+anyio==4.12.1
 
 # Database
-sqlmodel>=0.0.14
-alembic>=1.13
-asyncpg>=0.29
-aiosqlite>=0.19
+sqlmodel==0.0.31
+SQLAlchemy==2.0.46
+alembic==1.18.3
+asyncpg==0.31.0              # app driver (PostgreSQL / Supabase)
+aiosqlite==0.22.1            # local development / tests
+psycopg[binary]==3.3.2       # sync driver for scripts (SQLite -> Postgres import)
 
 # Authentication
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-bcrypt==3.2.2
-python-dotenv==1.0.0
+bcrypt==3.2.2                # passlib 1.7.4 is incompatible with bcrypt>=4.1
 
+# Validation / settings
+pydantic==2.12.5
+pydantic-settings==2.12.0
+email-validator==2.3.0
 
-# Validation
-pydantic>=2.5
-pydantic-settings>=2.1
-email-validator>=2.1
-
-# HTTP / Payments
-httpx>=0.26
-requests==2.31.0
-
-
-# PDF Generation
-reportlab>=4.0
-weasyprint>=60
+# HTTP (Paystack)
+httpx==0.28.1
 
 # Email
-aiosmtplib>=3.0
-jinja2>=3.1
+fastapi-mail==1.6.1
+aiosmtplib==5.1.0
+Jinja2==3.1.6
 
-# Image Processing
-Pillow>=10.1,<11
+# PDF generation
+reportlab==4.4.9
+pillow==10.4.0
 
-# Excel / CSV
-openpyxl>=3.1
-pandas>=2.2
+# Excel / CSV bulk upload
+pandas==3.0.0
+openpyxl==3.1.5
 
-# Utilities
-python-slugify>=8.0
-
+# Images
 cloudinary==1.41.0

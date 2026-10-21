@@ -14,6 +14,8 @@ class EnrollmentCreate(BaseModel):
 
 class StudentEnrollmentHistory(BaseModel):
     student_id: str
+    student_name: str
+    student_admission_number: str
     enrollments: List[dict]  # List of enrollment records
     
 

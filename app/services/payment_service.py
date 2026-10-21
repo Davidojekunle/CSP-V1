@@ -1,53 +1,43 @@
 # app/services/payment_service.py
 """High-level service for payment logic, including manual and webhook processing."""
 import json
-from typing import Dict, Optional, List
-from sqlmodel import Session, select
-from sqlalchemy import or_, and_, func
-from fastapi import HTTPException
+import logging
+import uuid
 from datetime import datetime
+from typing import Optional, List
 
+import httpx
+from fastapi import HTTPException
+from sqlalchemy import or_, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
+from app.core.config import settings
+from app.core.database import AsyncSessionFactory
 from app.models import Invoice, Payment, PaymentStatus, InvoiceStatus, User, PaymentMethod
-from app.schemas.payment import ManualPaymentRequest
+from app.schemas.payment import ManualPaymentRequest, PaymentInitializeRequest
 from app.services.payment.paystack import paystack_service
-from app.services.email.sender import send_payment_receipt_email # Assuming this exists
+from app.services.email.sender import send_payment_receipt_email
 from app.services.pdf.invoice import invoice_pdf_service
-# Import your PDF service to attach receipts
-# from app.services.pdf.invoice import invoice_pdf_service
+
+logger = logging.getLogger(__name__)
+
 
 def _parse_date(date_string: str):
     """Helper function to parse a date string into a datetime object."""
     return datetime.strptime(date_string, "%Y-%m-%d").date()
 
 
-def _update_payment_and_invoice(payment: Payment, verified_data: Dict, db: Session):
-    """
-    Updates a Payment record with verified data from Paystack and updates the
-    corresponding Invoice. This function is the single source of truth for
-    processing a successful payment.
-    """
-    # 1. Update the Payment object
-    payment.status = PaymentStatus.successful
-    payment.paystack_response = json.dumps(verified_data)
-    payment.gateway_response = verified_data.get("gateway_response")
-    
-    # Safely get the payment channel/method
-    channel = verified_data.get("channel")
-    try:
-        payment.payment_method = PaymentMethod(channel) if channel else None
-    except ValueError:
-        payment.payment_method = channel # Store as string if not a valid enum member
-        
-    payment.paid_at = datetime.utcnow()
-    db.add(payment)
+async def _get_invoice_for_update(invoice_id: str, db: AsyncSession) -> Optional[Invoice]:
+    # Row lock on Postgres so concurrent payments can't lose an update to paid_amount
+    return (await db.execute(
+        select(Invoice).where(Invoice.id == invoice_id).with_for_update()
+    )).scalars().first()
 
-    # 2. Update the corresponding Invoice object
-    invoice = db.get(Invoice, payment.invoice_id)
-    if not invoice:
-        print(f"CRITICAL ERROR: Invoice ID {payment.invoice_id} not found for payment {payment.id}")
-        return
 
-    invoice.paid_amount += payment.amount
+def _apply_payment_to_invoice(invoice: Invoice, amount_paid: float, db: AsyncSession):
+    """Updates an invoice's amounts and status after a payment."""
+    invoice.paid_amount += amount_paid
     invoice.balance_due = invoice.total_amount - invoice.paid_amount
 
     # Use a small tolerance for floating point comparisons
@@ -56,56 +46,212 @@ def _update_payment_and_invoice(payment: Payment, verified_data: Dict, db: Sessi
         invoice.balance_due = 0.0  # Normalize to zero
     else:
         invoice.status = InvoiceStatus.partial
-        
+    invoice.updated_at = datetime.utcnow()
     db.add(invoice)
 
 
-async def process_successful_webhook_payment(webhook_data: dict, db: Session):
+async def initialize_student_payment(
+    invoice_id: str,
+    payment_data: Optional[PaymentInitializeRequest],
+    student: User,
+    db: AsyncSession
+) -> dict:
+    """
+    Handles all logic for initializing a student payment.
+    1. Validates the invoice and amount.
+    2. Creates a pending Payment record.
+    3. Calls Paystack to get an authorization URL.
+    4. Returns Paystack's response (plus our payment_id).
+    """
+    payment_data = payment_data or PaymentInitializeRequest()
+
+    invoice = await db.get(Invoice, invoice_id)
+    if not invoice or invoice.student_id != student.id:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    if invoice.status in [InvoiceStatus.paid, InvoiceStatus.cancelled]:
+        raise HTTPException(status_code=400, detail=f"Invoice cannot be paid (status: {invoice.status.value})")
+
+    # Determine payment amount
+    amount = invoice.balance_due
+    if payment_data.amount:
+        if 0 < payment_data.amount <= invoice.balance_due:
+            amount = payment_data.amount
+        else:
+            raise HTTPException(status_code=400, detail="Payment amount is invalid or exceeds balance due.")
+
+    # Create pending payment record
+    payment_ref = f"PAY_{invoice.invoice_number}_{str(uuid.uuid4())[:8].upper()}"
+    payment = Payment(
+        invoice_id=invoice.id, paystack_reference=payment_ref,
+        amount=amount, status=PaymentStatus.pending
+    )
+    db.add(payment)
+    await db.commit()
+
+    response = None
+    try:
+        response = await paystack_service.initialize_transaction(
+            email=student.email, amount=amount, reference=payment_ref,
+            callback_url=payment_data.callback_url or settings.PAYSTACK_CALLBACK_URL,
+            metadata={"payment_id": payment.id, "invoice_id": invoice.id}
+        )
+    except httpx.HTTPError as e:
+        logger.error("Paystack initialize failed for %s: %s", payment_ref, e)
+
+    if not response or not response.get("status"):
+        payment.status = PaymentStatus.failed
+        if response:
+            payment.paystack_response = json.dumps(response)
+        db.add(payment)
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Failed to initialize payment with provider.")
+
+    # Paystack's response (older clients read data.authorization_url) plus the flat
+    # fields the dashboard reads (authorization_url, access_code, reference)
+    data = response.get("data") or {}
+    return {
+        **response,
+        "payment_id": payment.id,
+        "authorization_url": data.get("authorization_url"),
+        "access_code": data.get("access_code"),
+        "reference": data.get("reference", payment_ref),
+    }
+
+
+async def _settle_paystack_payment(payment: Payment, db: AsyncSession) -> Optional[Invoice]:
+    """
+    Re-verifies a pending Paystack payment and, if Paystack confirms the full
+    expected amount, marks it successful and applies it to the invoice.
+    Returns the updated invoice, or None if verification failed (payment marked failed).
+    Raises httpx.HTTPError if Paystack could not be reached (payment left pending).
+    The caller must hold a row lock on the payment and commit.
+    """
+    verification = await paystack_service.verify_transaction(payment.paystack_reference)
+    data = verification.get("data") or {}
+    expected_kobo = int(round(payment.amount * 100))
+    if not verification.get("status") or data.get("status") != "success" or data.get("amount") != expected_kobo:
+        logger.warning("Paystack verification failed for %s (status=%s, amount=%s, expected=%s)",
+                       payment.paystack_reference, data.get("status"), data.get("amount"), expected_kobo)
+        payment.status = PaymentStatus.failed
+        payment.paystack_response = json.dumps(verification)
+        payment.updated_at = datetime.utcnow()
+        db.add(payment)
+        return None
+
+    payment.status = PaymentStatus.successful
+    payment.paystack_response = json.dumps(data)
+    payment.gateway_response = data.get("gateway_response")
+    channel = data.get("channel")
+    try:
+        payment.payment_method = PaymentMethod(channel) if channel else None
+    except ValueError:
+        payment.payment_method = None  # Unknown channel; raw value is kept in paystack_response
+    payment.paid_at = datetime.utcnow()
+    payment.updated_at = datetime.utcnow()
+    db.add(payment)
+
+    invoice = await _get_invoice_for_update(payment.invoice_id, db)
+    if not invoice:
+        logger.critical("Invoice %s not found for payment %s", payment.invoice_id, payment.id)
+        return None
+    _apply_payment_to_invoice(invoice, payment.amount, db)
+    return invoice
+
+
+async def _send_receipt(payment: Payment, invoice: Invoice, db: AsyncSession):
+    try:
+        student = await db.get(User, invoice.student_id)
+        if student and student.email:
+            pdf_buffer = await invoice_pdf_service.generate_invoice_pdf(invoice.id, db)
+            await send_payment_receipt_email(
+                recipient_email=student.email,
+                student_name=student.first_name,
+                receipt_details={
+                    'invoice_number': invoice.invoice_number,
+                    'amount_paid_this_time': payment.amount,
+                    'paid_amount': invoice.paid_amount,
+                    'balance_due': invoice.balance_due
+                },
+                pdf_attachment_bytes=pdf_buffer.getvalue()
+            )
+    except Exception:
+        logger.exception("Failed to send receipt for payment %s", payment.paystack_reference)
+
+
+async def process_successful_webhook_payment(webhook_data: dict):
     """
     Processes a 'charge.success' event from a Paystack webhook.
-    This is designed to be run in the background.
+    Runs as a background task, so it opens its own database session
+    (the request's session is closed by the time this runs).
     """
     reference = webhook_data.get("data", {}).get("reference")
     if not reference:
-        print(f"Webhook Error: No reference found.")
+        logger.warning("Paystack webhook without a reference")
         return
 
-    payment = db.exec(select(Payment).where(Payment.paystack_reference == reference)).first()
-    if not payment or payment.status == PaymentStatus.successful:
-        print(f"Webhook Info: Payment not found or already processed for reference {reference}.")
-        return
-
-    # Security: Always re-verify the transaction with Paystack's API
-    verification = paystack_service.verify_transaction(reference)
-    if not verification.get("status") or verification["data"]["status"] != "success":
-        payment.status = PaymentStatus.failed
-        db.add(payment)
-        db.commit()
-        return
-
-    # Update payment and invoice records
-    _update_payment_and_invoice(payment, verification["data"]["amount"] / 100, db)
-    
-    # --- Send Receipt Email ---
-    # ... (Email sending logic would go here, called as a background task if possible)
-    print(f"Webhook Success: Payment for {reference} processed.")
+    async with AsyncSessionFactory() as db:
+        payment = (await db.execute(
+            select(Payment).where(Payment.paystack_reference == reference).with_for_update()
+        )).scalars().first()
+        if not payment or payment.status == PaymentStatus.successful:
+            logger.info("Webhook: payment not found or already processed for %s", reference)
+            return
+        try:
+            invoice = await _settle_paystack_payment(payment, db)
+        except httpx.HTTPError as e:
+            # Leave it pending; Paystack retries webhooks that don't succeed
+            logger.error("Paystack verify failed for %s: %s", reference, e)
+            raise
+        await db.commit()
+        if invoice:
+            logger.info("Webhook: payment %s processed", reference)
+            await _send_receipt(payment, invoice, db)
 
 
-def record_manual_payment(payment_data: ManualPaymentRequest, admin_user: User, db: Session) -> tuple[Payment, Invoice]:
+async def verify_pending_payment(payment_id: str, db: AsyncSession) -> dict:
+    """Admin action: re-check a Paystack payment with Paystack (e.g. when a webhook was missed)."""
+    payment = (await db.execute(select(Payment).where(Payment.id == payment_id).with_for_update())).scalars().first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if payment.status == PaymentStatus.successful:
+        return {"message": "Payment is already verified.", "status": payment.status.value}
+    if payment.paystack_reference.startswith("MANUAL_"):
+        raise HTTPException(status_code=400, detail="Manual payments are not verified with Paystack.")
+    try:
+        invoice = await _settle_paystack_payment(payment, db)
+    except httpx.HTTPError as e:
+        logger.error("Paystack verify failed for %s: %s", payment.paystack_reference, e)
+        raise HTTPException(status_code=502, detail="Could not reach Paystack. Try again shortly.")
+    await db.commit()
+    if not invoice:
+        raise HTTPException(status_code=400, detail="Paystack did not confirm this payment. It has been marked as failed.")
+    await _send_receipt(payment, invoice, db)
+    return {"message": "Payment verified successfully.", "status": payment.status.value,
+            "invoice_status": invoice.status.value, "balance_due": invoice.balance_due}
+
+
+async def record_manual_payment(payment_data: ManualPaymentRequest, admin_user: User, db: AsyncSession) -> tuple[Payment, Invoice]:
     """Records a manual (offline) payment made by an admin.
-    
+
     Returns:
         A tuple containing the created Payment object and the updated Invoice object.
     """
-    invoice = db.get(Invoice, payment_data.invoice_id)
-    if not invoice or invoice.status in [InvoiceStatus.paid, InvoiceStatus.cancelled]:
+    invoice = await _get_invoice_for_update(payment_data.invoice_id, db)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+    if invoice.status in [InvoiceStatus.paid, InvoiceStatus.cancelled]:
         raise HTTPException(status_code=400, detail=f"Invoice is not available for payment (status: {invoice.status.value})")
-    
+
     if payment_data.amount <= 0 or payment_data.amount > invoice.balance_due:
         raise HTTPException(status_code=400, detail="Invalid payment amount.")
 
-    payment_reference = f"MANUAL_{payment_data.payment_method.value.upper()}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
+    # Suffix keeps references unique when two payments are recorded in the same second
+    payment_reference = (
+        f"MANUAL_{payment_data.payment_method.value.upper()}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        f"_{uuid.uuid4().hex[:6].upper()}"
+    )
+
     payment = Payment(
         invoice_id=invoice.id,
         paystack_reference=payment_reference,
@@ -116,30 +262,14 @@ def record_manual_payment(payment_data: ManualPaymentRequest, admin_user: User, 
         paystack_response=json.dumps({"manual": True, "notes": payment_data.notes, "recorded_by": admin_user.id})
     )
     db.add(payment)
-    
-    _update_invoice_status_from_payment(invoice, payment.amount, db)
-    
-    db.commit()
-    db.refresh(payment)
-    db.refresh(invoice) # Also refresh the invoice to get its latest state
-    
+    _apply_payment_to_invoice(invoice, payment.amount, db)
+    await db.commit()
+
     return payment, invoice
 
-def _update_invoice_status_from_payment(invoice: Invoice, amount_paid: float, db: Session):
-    """Helper to update an invoice's amounts and status after a payment."""
-    invoice.paid_amount += amount_paid
-    invoice.balance_due = invoice.total_amount - invoice.paid_amount
-    
-    if invoice.balance_due <= 0.01:
-        invoice.status = InvoiceStatus.paid
-        invoice.balance_due = 0.0
-    else:
-        invoice.status = InvoiceStatus.partial
-    db.add(invoice)
 
-
-def get_all_payments(
-    db: Session,
+async def get_all_payments(
+    db: AsyncSession,
     skip: int,
     limit: int,
     status: Optional[PaymentStatus],
@@ -149,20 +279,19 @@ def get_all_payments(
     date_to: Optional[str]
 ) -> List[Payment]:
     """
-    PERFORMANCE: Fetches a list of all payments with comprehensive filtering
-    using a single, efficient JOIN query.
+    Fetches a list of all payments with comprehensive filtering
+    using a single JOIN query.
     """
     query = (
         select(Payment)
         .join(Invoice, Payment.invoice_id == Invoice.id)
         .join(User, Invoice.student_id == User.id)
     )
-    
+
     conditions = []
-    
     if status: conditions.append(Payment.status == status)
     if payment_method: conditions.append(Payment.payment_method == payment_method)
-    
+
     if search:
         term = f"%{search.strip()}%"
         conditions.append(or_(
@@ -174,19 +303,49 @@ def get_all_payments(
         ))
 
     if date_from:
-        from_date = _parse_date(date_from) # Reuse our helper
-        conditions.append(func.date(Payment.created_at) >= from_date)
-    
+        conditions.append(func.date(Payment.created_at) >= _parse_date(date_from))
     if date_to:
-        to_date = _parse_date(date_to)
-        conditions.append(func.date(Payment.created_at) <= to_date)
-        
+        conditions.append(func.date(Payment.created_at) <= _parse_date(date_to))
+
     if conditions:
         query = query.where(and_(*conditions))
 
-    
-    results = db.exec(
-        query.offset(skip).limit(limit).order_by(Payment.created_at.desc())
-    ).all()
-    
-    return results
+    return (await db.execute(
+        query.order_by(Payment.created_at.desc(), Payment.id).offset(skip).limit(limit)
+    )).scalars().all()
+
+
+async def get_student_payment_history(student_user: User, db: AsyncSession) -> List[dict]:
+    """
+    Fetches all successful payments for a student in one query.
+    """
+    query = (
+        select(Payment, Invoice.invoice_number)
+        .join(Invoice, Payment.invoice_id == Invoice.id)
+        .where(
+            Invoice.student_id == student_user.id,
+            Payment.status == PaymentStatus.successful
+        )
+        .order_by(Payment.paid_at.desc(), Payment.id)
+    )
+
+    rows = (await db.execute(query)).all()
+    student_name = f"{student_user.first_name} {student_user.last_name}"
+
+    return [
+        {
+            "payment_id": p.id,
+            "id": p.id,
+            "reference": p.paystack_reference,
+            "amount": p.amount,
+            "paid_at": p.paid_at,
+            "created_at": p.created_at,
+            "invoice_id": p.invoice_id,
+            "invoice_number": invoice_number,
+            "student_id": student_user.id,
+            "student_name": student_name,
+            "status": p.status,
+            "payment_method": p.payment_method.value if p.payment_method else None,
+        }
+        for p, invoice_number in rows
+    ]
