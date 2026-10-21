@@ -107,8 +107,16 @@ async def initialize_student_payment(
         await db.commit()
         raise HTTPException(status_code=502, detail="Failed to initialize payment with provider.")
 
-    # Same shape the endpoint has always returned (Paystack's response), plus our payment id
-    return {**response, "payment_id": payment.id}
+    # Paystack's response (older clients read data.authorization_url) plus the flat
+    # fields the dashboard reads (authorization_url, access_code, reference)
+    data = response.get("data") or {}
+    return {
+        **response,
+        "payment_id": payment.id,
+        "authorization_url": data.get("authorization_url"),
+        "access_code": data.get("access_code"),
+        "reference": data.get("reference", payment_ref),
+    }
 
 
 async def process_successful_webhook_payment(webhook_data: dict):
@@ -281,24 +289,32 @@ async def get_student_payment_history(student_user: User, db: AsyncSession) -> L
     Fetches all successful payments for a student in one query.
     """
     query = (
-        select(Payment)
+        select(Payment, Invoice.invoice_number)
         .join(Invoice, Payment.invoice_id == Invoice.id)
         .where(
             Invoice.student_id == student_user.id,
             Payment.status == PaymentStatus.successful
         )
-        .order_by(Payment.paid_at.desc())
+        .order_by(Payment.paid_at.desc(), Payment.id)
     )
 
-    successful_payments = (await db.execute(query)).scalars().all()
+    rows = (await db.execute(query)).all()
+    student_name = f"{student_user.first_name} {student_user.last_name}"
 
     return [
         {
             "payment_id": p.id,
+            "id": p.id,
             "reference": p.paystack_reference,
             "amount": p.amount,
             "paid_at": p.paid_at,
-            "invoice_id": p.invoice_id
+            "created_at": p.created_at,
+            "invoice_id": p.invoice_id,
+            "invoice_number": invoice_number,
+            "student_id": student_user.id,
+            "student_name": student_name,
+            "status": p.status,
+            "payment_method": p.payment_method.value if p.payment_method else None,
         }
-        for p in successful_payments
+        for p, invoice_number in rows
     ]

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import secrets
 
 from app.core.database import get_session
@@ -22,6 +22,7 @@ from app.schemas.auth import (
     UserProfileResponse,
     MessageResponse
 )
+from app.services import user_service
 from app.services.email.sender import send_password_reset_email
 
 router = APIRouter()
@@ -61,13 +62,18 @@ async def login_for_access_token(
 
 @router.get("/me", response_model=UserProfileResponse)
 async def get_current_user_profile(
-    current_user: dict = Depends(get_current_active_user)
+    current_user: dict = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_session)
 ):
     """
-    Get current user profile.
-    PRESERVED: Exact response structure.
+    Get current user profile: the original seven fields plus personal details
+    and the student/staff profile used by the "My Profile" page.
     """
     user = current_user["user"]
+    full = await user_service.build_user_response(user, session)
+    dob = user.date_of_birth
+    today = date.today()
+    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day)) if dob else None
     return UserProfileResponse(
         id=user.id,
         email=user.email,
@@ -75,7 +81,15 @@ async def get_current_user_profile(
         first_name=user.first_name,
         last_name=user.last_name,
         role=user.role,
-        is_active=user.is_active
+        is_active=user.is_active,
+        middle_name=user.middle_name,
+        phone=user.phone,
+        gender=user.gender.value if hasattr(user.gender, "value") else user.gender,
+        date_of_birth=dob,
+        age=age,
+        profile_picture_url=user.profile_picture_url,
+        student_profile=full.student_profile,
+        staff_profile=full.staff_profile,
     )
 
 

@@ -37,11 +37,13 @@ class TestAuthEndpointContracts:
         assert response.status_code == 200
         data = response.json()
         
-        # CRITICAL: Verify exact field names
-        assert set(data.keys()) == {
-            "id", "email", "username", "first_name", 
+        # CRITICAL: the original fields must always be present (extra profile
+        # fields for the dashboard's "My Profile" page are allowed)
+        assert {
+            "id", "email", "username", "first_name",
             "last_name", "role", "is_active"
-        }
+        } <= set(data.keys())
+        assert data["date_of_birth"] == "1990-01-01" and isinstance(data["age"], int)
         assert data["email"] == "testadmin@test.com"
         assert data["username"] == "testadmin"
         assert data["role"] == "admin"
