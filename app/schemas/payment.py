@@ -22,3 +22,15 @@ class PaymentResponse(BaseModel):
     created_at: datetime
     invoice_id: str
     student_id: str
+
+
+class PaymentHistoryResponse(BaseModel):
+    payment_id: str
+    reference: str
+    amount: float
+    paid_at: datetime
+    invoice_id: str
+
+class PaymentInitializeRequest(BaseModel):
+    amount: Optional[float] = None  # If None, pay full balance
+    callback_url: Optional[str] = None

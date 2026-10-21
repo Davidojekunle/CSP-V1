@@ -1,5 +1,7 @@
 # app/services/student_service.py
 from sqlmodel import Session, select, func, and_
+
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from datetime import date
 from typing import Dict, Any, List
@@ -18,21 +20,24 @@ def _calculate_age(born: date) -> int:
     today = date.today()
     return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
 
-def get_student_dashboard_data(student_user: User, db: Session) -> StudentDashboardResponse:
+async def get_student_dashboard_data(student_user: User, db: AsyncSession) -> StudentDashboardResponse:
     """
     AGGREGATOR: Collects all data for the student dashboard.
     PERFORMANCE: Uses database-level functions (avg, sum, count) to minimize I/O.
     """
     # 1. Fetch Student Profile
-    student_profile = db.exec(
+    result = await db.execute(
         select(StudentProfile).where(StudentProfile.user_id == student_user.id)
-    ).first()
+    )
+    student_profile = result.scalars().first()
     if not student_profile:
         raise HTTPException(status_code=404, detail="Student profile not found")
 
     # 2. Get current academic context
-    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
-    current_term = db.exec(select(Term).where(Term.is_current == True)).first()
+    result_session = await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))
+    current_session = result_session.scalars().first()
+    result_term = await db.execute(select(Term).where(Term.is_current == True))
+    current_term = result_term.scalars().first()
 
     # 3. Calculate Academic KPIs (Using DB Aggregates)
     avg_score = 0.0
@@ -45,15 +50,17 @@ def get_student_dashboard_data(student_user: User, db: Session) -> StudentDashbo
             Result.is_published == True,
             Result.total.isnot(None)
         )
-        avg_score_result = db.exec(avg_query).one_or_none()
+        result = await db.execute(avg_query)
+        avg_score_result = result.scalars().first()
         avg_score = round(avg_score_result or 0.0, 2)
         if avg_score > 0:
             context_period = f"As at {current_term.name.value} {current_session.name}"
 
-    total_released_results = db.exec(select(func.count(Result.id)).where(
+    total_released_results_query = await db.execute(select(func.count(Result.id)).where(
         Result.student_id == student_user.id,
         Result.is_published == True
-    )).one()
+    ))
+    total_released_results = total_released_results_query.scalar_one()
 
     # 4. Calculate Financial KPIs (Using DB Aggregates)
     financial_query = select(
@@ -63,7 +70,9 @@ def get_student_dashboard_data(student_user: User, db: Session) -> StudentDashbo
         Invoice.student_id == student_user.id,
         Invoice.status.in_([InvoiceStatus.issued, InvoiceStatus.partial, InvoiceStatus.overdue])
     )
-    inv_count, balance = db.exec(financial_query).first() or (0, 0.0)
+    result = await db.execute(financial_query)
+    row = result.first()
+    inv_count, balance = row if row else (0, 0.0)
 
     # 5. Determine Enrollment Status Logic
     enrollment_info = None
@@ -75,7 +84,8 @@ def get_student_dashboard_data(student_user: User, db: Session) -> StudentDashbo
             Enrollment.session_id == current_session.id,
             Enrollment.is_active == True
         )
-        res = db.exec(enr_query).first()
+        result = await db.execute(enr_query)
+        res = result.first()
         if res:
             enr, cls = res
             enrollment_info = {

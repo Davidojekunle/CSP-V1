@@ -1,19 +1,19 @@
+import logging
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from sqlmodel import select
+
 from app.core.config import settings
-from app.core.database import create_db_and_tables, get_session
+from app.core.my_logging import setup_logging
+from app.core.database import create_db_and_tables, AsyncSessionFactory, async_engine, check_database_connection
 from app.core.security import get_password_hash
 from app.models import User, UserRole, Gender, StudentProfile, StaffProfile
 from app.models import Class, Subject, AcademicSession, Term
-from datetime import date
-from sqlmodel import Session, select
-
-# Import routes (will be created in Phase 3)
-# from app.api.v1 import auth, admin, students, etc.
-
-# For now, import old routes to maintain compatibility
-import sys
-sys.path.append('..')  # Temporary - to import old routes
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.users import router as users_router
@@ -21,19 +21,40 @@ from app.api.v1.bulk_upload import router as bulk_uploads_router
 from app.api.v1 import dashboard as dashboard_router
 from app.api.v1 import academic as academic_router
 from app.api.v1 import enrollments as enrollment_router
-from app.api.v1 import activity_logs as activity_logs_router  
+from app.api.v1 import activity_logs as activity_logs_router
 from app.api.v1 import results as results_router
 from app.api.v1.fees import router as admin_fees_router, student_router as student_fees_router, neutral_fee_router
 from app.api.v1 import payments as payments_router
 from app.api.v1.staff import router as staff_routes, traits_router
 from app.api.v1.students import router as student_routes
 
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.AUTO_CREATE_TABLES:
+        await create_db_and_tables()
+    if settings.SEED_SAMPLE_DATA:
+        await create_sample_data()
+    if settings.is_production and len(settings.SECRET_KEY) < 32:
+        logger.warning("SECRET_KEY is shorter than 32 characters; use a long random value in production.")
+    logger.info("Startup complete (environment=%s)", settings.ENVIRONMENT)
+    yield
+    await async_engine.dispose()
+
+
 # Create FastAPI app
 app = FastAPI(
     title="School Management System API",
     description="A comprehensive school management system with authentication",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
+
+# Compress large JSON responses (lists of students, invoices, results)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Add CORS middleware - PRESERVED: Same origins as original
 app.add_middleware(
@@ -60,35 +81,19 @@ app.include_router(staff_routes)
 app.include_router(traits_router)
 app.include_router(student_routes)
 app.include_router(neutral_fee_router)
-# app.include_router(admin_routes)
-# app.include_router(academic_routes)
-# app.include_router(enrollment_routes)
-# app.include_router(results_routes)
-# app.include_router(fee_routes)
-# app.include_router(dashboard_routes)
-# app.include_router(staff_routes)
-# app.include_router(traits_routes)
 
 
-
-
-@app.on_event("startup")
-def on_startup():
-    """Initialize database and create sample data"""
-    create_db_and_tables()
-    create_sample_data()
-
-
-def create_sample_data():
+async def create_sample_data():
     """
-    Create sample users for testing.
-    PRESERVED: Exact same sample data as original.
+    Create sample users for local development (SEED_SAMPLE_DATA).
+    Never enabled by default in production: these accounts have known passwords.
     """
-    with next(get_session()) as session:
+    async with AsyncSessionFactory() as session:
         # Check if admin already exists
-        existing_admin = session.exec(
+        result = await session.execute(
             select(User).where(User.email == "admin@school.com")
-        ).first()
+        )
+        existing_admin = result.scalars().first()
         if existing_admin:
             return
         
@@ -97,7 +102,7 @@ def create_sample_data():
             username="admin",
             email="admin@school.com",
             phone="+2348012345678",
-            password_hash=get_password_hash("admin123"),
+            password_hash= await  get_password_hash("admin123"),
             role=UserRole.admin,
             first_name="System",
             last_name="Administrator",
@@ -111,7 +116,7 @@ def create_sample_data():
             username="teacher1",
             email="teacher@school.com",
             phone="+2348012345679",
-            password_hash=get_password_hash("teacher123"),
+            password_hash=await get_password_hash("teacher123"),
             role=UserRole.staff,
             first_name="John",
             last_name="Doe",
@@ -125,7 +130,7 @@ def create_sample_data():
             username="student1",
             email="student@school.com",
             phone="+2348012345680",
-            password_hash=get_password_hash("student123"),
+            password_hash=await get_password_hash("student123"),
             role=UserRole.student,
             first_name="Jane",
             last_name="Smith",
@@ -134,10 +139,10 @@ def create_sample_data():
         )
         session.add(student)
         
-        session.commit()
-        session.refresh(admin)
-        session.refresh(teacher)
-        session.refresh(student)
+        await session.commit()
+        await session.refresh(admin)
+        await session.refresh(teacher)
+        await session.refresh(student)
         
         # Create teacher profile
         teacher_profile = StaffProfile(
@@ -156,8 +161,8 @@ def create_sample_data():
             is_current=True
         )
         session.add(session_2024)
-        session.commit()
-        session.refresh(session_2024)
+        await session.commit()
+        await session.refresh(session_2024)
         
         first_term = Term(
             session_id=session_2024.id,
@@ -176,8 +181,8 @@ def create_sample_data():
             form_teacher_id=teacher.id
         )
         session.add(class_jss1a)
-        session.commit()
-        session.refresh(class_jss1a)
+        await session.commit()
+        await session.refresh(class_jss1a)
         
         # Create student profile
         student_profile = StudentProfile(
@@ -197,12 +202,8 @@ def create_sample_data():
         session.add(mathematics)
         session.add(english)
         
-        session.commit()
-        print("✅ Sample data created successfully!")
-        print("🔐 Login Credentials:")
-        print("   Admin: admin@school.com / admin123")
-        print("   Teacher: teacher@school.com / teacher123")
-        print("   Student: student@school.com / student123")
+        await session.commit()
+        logger.info("Sample data created (admin@school.com, teacher@school.com, student@school.com)")
 
 
 # Root endpoint - PRESERVED
@@ -216,19 +217,17 @@ async def root():
     }
 
 
-# Health check endpoint - PRESERVED
+# Health check endpoint - PRESERVED shape; also reports database connectivity
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": "2024-01-01"}
+    if not await check_database_connection():
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "timestamp": datetime.utcnow().isoformat()})
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("🚀 Starting School Management System API...")
-    print("📖 API Documentation: http://localhost:8000/docs")
-    print("🔗 Interactive API: http://localhost:8000/redoc")
-    
+
     uvicorn.run(
         "app.main:app",
         host=settings.HOST,

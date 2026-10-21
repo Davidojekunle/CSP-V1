@@ -3,10 +3,12 @@
 Service for handling bulk data uploads from files (CSV/Excel).
 Contains heavy processing logic extracted from admin.py.
 """
-import pandas as pd
 import io
+
+import pandas as pd
+from anyio.to_thread import run_sync
 from fastapi import UploadFile, HTTPException
-from sqlmodel import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Dict, Tuple
 
 from app.models import User, UserRole, Gender, StudentProfile, StaffProfile
@@ -25,22 +27,35 @@ def _generate_random_password(length: int = 8) -> str:
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-def _parse_file(file: UploadFile) -> pd.DataFrame:
-    """Reads an UploadFile into a Pandas DataFrame."""
+def _read_frame(filename: str, content: bytes) -> pd.DataFrame:
+    # Read every cell as text: keeps leading zeros in phone numbers and avoids "8012345678.0"
+    if filename.endswith('.csv'):
+        return pd.read_csv(io.BytesIO(content), dtype=str)
+    if filename.endswith(('.xlsx', '.xls')):
+        return pd.read_excel(io.BytesIO(content), dtype=str)
+    raise HTTPException(status_code=400, detail="Unsupported file format. Use CSV or Excel.")
+
+
+async def _parse_file(file: UploadFile) -> pd.DataFrame:
+    """Reads an UploadFile into a Pandas DataFrame (parsing runs off the event loop)."""
     try:
-        content = file.file.read()
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(content))
-        elif file.filename.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(io.BytesIO(content))
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format. Use CSV or Excel.")
-        return df
+        content = await file.read()
+        return await run_sync(_read_frame, (file.filename or "").lower(), content)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read or parse file: {str(e)}")
 
 
-async def process_student_upload(file: UploadFile, session: Session) -> Dict:
+def _cell(row, key: str) -> str:
+    """Stripped cell text; empty string for missing/blank cells (pandas gives NaN, not '')."""
+    value = row.get(key)
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+async def process_student_upload(file: UploadFile, session: AsyncSession) -> Dict:
     """
     Processes a student bulk upload file, creating users and profiles.
     Returns a detailed report of successes and failures.
@@ -49,7 +64,7 @@ async def process_student_upload(file: UploadFile, session: Session) -> Dict:
         "first_name", "last_name", "email", "phone", "gender", "date_of_birth",
         "enrollment_date", "guardian_name", "guardian_phone", "guardian_email"
     ]
-    df = _parse_file(file)
+    df = await _parse_file(file)
     
     missing_cols = [col for col in required_columns if col not in df.columns]
     if missing_cols:
@@ -61,27 +76,27 @@ async def process_student_upload(file: UploadFile, session: Session) -> Dict:
     for idx, row in df.iterrows():
         try:
             # --- Data Validation (identical to original) ---
-            email = str(row["email"]).strip()
-            phone = str(row["phone"]).strip()
+            email = _cell(row, "email")
+            phone = _cell(row, "phone")
             if not email or not phone:
                 raise ValueError("Email and phone are required.")
 
-            password = str(row.get("password", "")).strip() or _generate_random_password()
-            gender_str = str(row["gender"]).strip().lower()
+            password = _cell(row, "password") or _generate_random_password()
+            gender_str = _cell(row, "gender").lower()
             if gender_str not in GENDER_MAP:
                 raise ValueError(f"Invalid gender '{gender_str}'. Must be male, female, or other.")
 
             # --- Prepare Data Transfer Objects (DTOs) ---
             student_profile_dto = StudentProfileCreate(
-                guardian_name=str(row["guardian_name"]),
-                guardian_phone=str(row["guardian_phone"]),
-                guardian_email=str(row["guardian_email"]),
+                guardian_name=_cell(row, "guardian_name"),
+                guardian_phone=_cell(row, "guardian_phone"),
+                guardian_email=_cell(row, "guardian_email"),
                 enrollment_date=pd.to_datetime(row["enrollment_date"]).date()
             )
 
             user_create_dto = UserCreate(
                 email=email, phone=phone, password=password, role=UserRole.student,
-                first_name=str(row["first_name"]), last_name=str(row["last_name"]),
+                first_name=_cell(row, "first_name"), last_name=_cell(row, "last_name"),
                 gender=GENDER_MAP[gender_str],
                 date_of_birth=pd.to_datetime(row["date_of_birth"]).date(),
                 student_profile_data=student_profile_dto
@@ -89,7 +104,7 @@ async def process_student_upload(file: UploadFile, session: Session) -> Dict:
             
             # --- Use the existing user_service to create the user ---
             # This demonstrates service-to-service calls and reusability
-            new_user = user_service.create_user_with_profile(user_create_dto, session)
+            new_user = await user_service.create_user_with_profile(user_create_dto, session)
             
             successes.append({
                 "email": new_user.email, "username": new_user.username,
@@ -105,10 +120,10 @@ async def process_student_upload(file: UploadFile, session: Session) -> Dict:
         except Exception as e:
             # If user_service.create_user_with_profile raises HTTPException, it rolls back.
             # For other errors, we must explicitly rollback.
-            session.rollback()
+            await session.rollback()
             failures.append({
                 "row": idx + 2, # Account for header row
-                "email": row.get("email", "N/A"),
+                "email": _cell(row, "email") or "N/A",
                 "error": str(e)
             })
 
@@ -121,11 +136,7 @@ async def process_student_upload(file: UploadFile, session: Session) -> Dict:
         "email_tasks": email_tasks # Pass tasks back to the route
     }
 
-# app/services/bulk_upload_service.py
-
-# ... (keep all existing imports and functions)
-
-async def process_staff_upload(file: UploadFile, session: Session) -> Dict:
+async def process_staff_upload(file: UploadFile, session: AsyncSession) -> Dict:
     """
     Processes a staff/admin bulk upload file, creating users and profiles.
     Returns a detailed report of successes and failures.
@@ -134,7 +145,7 @@ async def process_staff_upload(file: UploadFile, session: Session) -> Dict:
         "first_name", "last_name", "email", "phone", "gender", "date_of_birth",
         "role", "job_title", "employment_date"
     ]
-    df = _parse_file(file)
+    df = await _parse_file(file)
     
     missing_cols = [col for col in required_columns if col not in df.columns]
     if missing_cols:
@@ -146,40 +157,40 @@ async def process_staff_upload(file: UploadFile, session: Session) -> Dict:
     for idx, row in df.iterrows():
         try:
             # --- Data Validation (identical to original) ---
-            email = str(row["email"]).strip()
-            phone = str(row["phone"]).strip()
+            email = _cell(row, "email")
+            phone = _cell(row, "phone")
             if not email or not phone:
                 raise ValueError("Email and phone are required.")
             
-            role_str = str(row["role"]).strip().lower()
+            role_str = _cell(row, "role").lower()
             if role_str not in ['staff', 'admin']:
                 raise ValueError(f"Invalid role '{role_str}'. Must be 'staff' or 'admin'")
 
-            password = str(row.get("password", "")).strip() or _generate_random_password()
-            gender_str = str(row["gender"]).strip().lower()
+            password = _cell(row, "password") or _generate_random_password()
+            gender_str = _cell(row, "gender").lower()
             if gender_str not in GENDER_MAP:
                 raise ValueError(f"Invalid gender '{gender_str}'. Must be male, female, or other.")
                 
             # --- Prepare Data Transfer Objects (DTOs) ---
             staff_profile_dto = StaffProfileCreate(
-                job_title=str(row["job_title"]),
+                job_title=_cell(row, "job_title"),
                 employment_date=pd.to_datetime(row["employment_date"]).date(),
-                qualifications=str(row.get("qualifications", "")).strip() or None,
-                address=str(row.get("address", "")).strip() or None,
-                emergency_contact_name=str(row.get("emergency_contact_name", "")).strip() or None,
-                emergency_contact_phone=str(row.get("emergency_contact_phone", "")).strip() or None
+                qualifications=_cell(row, "qualifications") or None,
+                address=_cell(row, "address") or None,
+                emergency_contact_name=_cell(row, "emergency_contact_name") or None,
+                emergency_contact_phone=_cell(row, "emergency_contact_phone") or None
             )
 
             user_create_dto = UserCreate(
                 email=email, phone=phone, password=password, role=UserRole(role_str),
-                first_name=str(row["first_name"]), last_name=str(row["last_name"]),
+                first_name=_cell(row, "first_name"), last_name=_cell(row, "last_name"),
                 gender=GENDER_MAP[gender_str],
                 date_of_birth=pd.to_datetime(row["date_of_birth"]).date(),
                 staff_profile_data=staff_profile_dto
             )
             
             # --- Use the existing user_service to create the user ---
-            new_user = user_service.create_user_with_profile(user_create_dto, session)
+            new_user = await user_service.create_user_with_profile(user_create_dto, session)
             
             successes.append({
                 "email": new_user.email, "username": new_user.username,
@@ -193,10 +204,10 @@ async def process_staff_upload(file: UploadFile, session: Session) -> Dict:
             })
 
         except Exception as e:
-            session.rollback()
+            await session.rollback()
             failures.append({
                 "row": idx + 2, # Account for header row
-                "email": row.get("email", "N/A"),
+                "email": _cell(row, "email") or "N/A",
                 "error": str(e)
             })
 

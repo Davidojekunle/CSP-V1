@@ -1,13 +1,14 @@
 # app/api/v1/enrollments.py
 """New, refactored API routes for student enrollment management."""
 from fastapi import APIRouter, Depends, Query, HTTPException, status
-from sqlmodel import Session, select
-from datetime import datetime
+from fastapi.encoders import jsonable_encoder
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 from typing import List, Optional, Dict
 
 from app.core.database import get_session
 from app.core.auth import get_current_admin
-from app.models import User, StudentProfile, Class, AcademicSession, Term
+from app.models import User, StudentProfile
 from app.schemas.enrollment import (
     PaginatedEnrollmentResponse, EnrollmentResponse, DashboardStatsResponse,
       BulkEnrollmentCreate, EnrollmentTransfer,
@@ -21,38 +22,21 @@ router = APIRouter(
     dependencies=[Depends(get_current_admin)]
 )
 
-def _build_enrollment_response(enrollment: dict, db: Session) -> EnrollmentResponse:
-    # This helper is needed to fetch related names, preserving the original response shape.
-    # We can optimize this later by doing joins in the service layer.
-    student = db.get(User, enrollment.student_id)
-    student_profile = db.exec(select(StudentProfile).where(StudentProfile.user_id == enrollment.student_id)).first()
-    class_obj = db.get(Class, enrollment.class_id)
-    academic_session = db.get(AcademicSession, enrollment.session_id)
-    term = db.get(Term, enrollment.term_id)
-    
-    return EnrollmentResponse(
-        id=enrollment.id, student_id=enrollment.student_id,
-        student_name=f"{student.first_name} {student.last_name}" if student else "N/A",
-        student_admission_number=student_profile.admission_number if student_profile else "N/A",
-        class_id=enrollment.class_id, class_name=class_obj.name if class_obj else "N/A",
-        session_id=enrollment.session_id, session_name=academic_session.name if academic_session else "N/A",
-        term_id=enrollment.term_id, term_name=term.name.value if term else "N/A",
-        is_active=enrollment.is_active, enrolled_at=str(enrollment.enrolled_at),
-        created_at=getattr(enrollment, 'created_at', datetime.utcnow())
-    )
+async def _build_enrollment_response(enrollment, db: AsyncSession) -> dict:
+    return (await enrollment_service.build_enrollment_responses([enrollment], db))[0]
 
 @router.get("/", response_model=PaginatedEnrollmentResponse)
 async def get_enrollments(
     session_id: Optional[str] = Query(None), class_id: Optional[str] = Query(None),
     student_id: Optional[str] = Query(None), is_active: Optional[bool] = Query(True), # Default to True
     skip: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500),
-    db: Session = Depends(get_session)
+    db: AsyncSession = Depends(get_session)
 ):
     """
     PERFORMANCE OPTIMIZED: Gets all enrollments with filtering and pagination.
     """
     # The service now does all the heavy lifting and returns data in the correct shape
-    enrollment_list, total_records = enrollment_service.get_enrollments(
+    enrollment_list, total_records = await enrollment_service.get_enrollments(
         db, session_id, class_id, student_id, is_active, skip, limit
     )
     
@@ -63,16 +47,16 @@ async def get_enrollments(
 
 
 @router.get("/stats/dashboard-summary", response_model=DashboardStatsResponse)
-async def get_dashboard_stats(db: Session = Depends(get_session)):
-    stats = enrollment_service.get_dashboard_summary(db)
+async def get_dashboard_stats(db: AsyncSession = Depends(get_session)):
+    stats = await enrollment_service.get_dashboard_summary(db)
     return stats
 
 
 @router.post("/bulk", response_model=List[EnrollmentResponse], status_code=status.HTTP_201_CREATED)
-async def bulk_enroll_students(bulk_data: BulkEnrollmentCreate, db: Session = Depends(get_session)):
-    successful_enrollments, errors = enrollment_service.bulk_enroll_students(bulk_data, db)
+async def bulk_enroll_students(bulk_data: BulkEnrollmentCreate, db: AsyncSession = Depends(get_session)):
+    successful_enrollments, errors = await enrollment_service.bulk_enroll_students(bulk_data, db)
     
-    responses = [_build_enrollment_response(enr, db) for enr in successful_enrollments]
+    responses = await enrollment_service.build_enrollment_responses(successful_enrollments, db)
     
     if errors:
         # PRESERVED: The original endpoint's multi-status error response
@@ -83,50 +67,51 @@ async def bulk_enroll_students(bulk_data: BulkEnrollmentCreate, db: Session = De
                 "success_count": len(responses),
                 "error_count": len(errors),
                 "errors": errors,
-                "successful_enrollments": responses
+                "successful_enrollments": jsonable_encoder(responses)
             }
         )
     return responses
 
 # PRESERVED: PUT /admin/enrollment/{id}/transfer
 @router.put("/{enrollment_id}/transfer", response_model=EnrollmentResponse)
-async def transfer_student(enrollment_id: str, transfer_data: EnrollmentTransfer, db: Session = Depends(get_session)):
-    updated_enrollment = enrollment_service.transfer_student(enrollment_id, transfer_data, db)
-    return _build_enrollment_response(updated_enrollment, db)
+async def transfer_student(enrollment_id: str, transfer_data: EnrollmentTransfer, db: AsyncSession = Depends(get_session)):
+    updated_enrollment = await enrollment_service.transfer_student(enrollment_id, transfer_data, db)
+    return await _build_enrollment_response(updated_enrollment, db)
 
 # PRESERVED: DELETE /admin/enrollment/{id}
 @router.delete("/{enrollment_id}", status_code=status.HTTP_200_OK, response_model=dict)
-async def withdraw_student(enrollment_id: str, db: Session = Depends(get_session)):
-    enrollment_service.withdraw_student(enrollment_id, db)
+async def withdraw_student(enrollment_id: str, db: AsyncSession = Depends(get_session)):
+    await enrollment_service.withdraw_student(enrollment_id, db)
     return {"message": "Student withdrawn successfully"}
 
 
 @router.put("/{enrollment_id}", response_model=EnrollmentResponse)
-async def update_enrollment(enrollment_id: str, update_data: EnrollmentUpdate, db: Session = Depends(get_session)):
-    updated_enrollment = enrollment_service.update_enrollment(enrollment_id, update_data, db)
-    return _build_enrollment_response(updated_enrollment, db)
+async def update_enrollment(enrollment_id: str, update_data: EnrollmentUpdate, db: AsyncSession = Depends(get_session)):
+    updated_enrollment = await enrollment_service.update_enrollment(enrollment_id, update_data, db)
+    return await _build_enrollment_response(updated_enrollment, db)
 
 # PRESERVED: GET /admin/enrollment/student/{id}/history
 @router.get("/student/{student_id}/history", response_model=StudentEnrollmentHistory)
-async def get_student_enrollment_history(student_id: str, db: Session = Depends(get_session)):
+async def get_student_enrollment_history(student_id: str, db: AsyncSession = Depends(get_session)):
     # This endpoint can be accessed by student/staff/admin, so we'll use a broader dependency if needed.
     # For now, keeping it under admin scope.
-    enrollments = enrollment_service.get_student_enrollment_history(student_id, db)
+    enrollments = await enrollment_service.get_student_enrollment_history(student_id, db)
     
-    student = db.get(User, student_id)
-    student_profile = db.exec(select(StudentProfile).where(StudentProfile.user_id == student_id)).first()
+    student = await db.get(User, student_id)
+    result_profile = await db.execute(select(StudentProfile).where(StudentProfile.user_id == student_id))
+    student_profile = result_profile.scalars().first()
     
     return StudentEnrollmentHistory(
         student_id=student.id,
         student_name=f"{student.first_name} {student.last_name}",
         student_admission_number=student_profile.admission_number if student_profile else "N/A",
-        enrollments=[_build_enrollment_response(e, db) for e in enrollments]
+        enrollments=await enrollment_service.build_enrollment_responses(enrollments, db)
     )
 
 # PRESERVED: POST /admin/enrollment/session/transition
 @router.post("/session/transition", response_model=Dict)
-async def transition_students_to_new_session(transition_data: SessionTransitionData, db: Session = Depends(get_session)):
-    result = enrollment_service.transition_students_to_new_session(transition_data, db)
+async def transition_students_to_new_session(transition_data: SessionTransitionData, db: AsyncSession = Depends(get_session)):
+    result = await enrollment_service.transition_students_to_new_session(transition_data, db)
     return result
 
 
@@ -135,9 +120,9 @@ async def get_class_enrollment_summary(
     class_id: str,
     session_id: Optional[str] = Query(None),
     term_id: Optional[str] = Query(None),
-    db: Session = Depends(get_session)
+    db: AsyncSession = Depends(get_session)
 ):
-    summary_data = enrollment_service.get_class_enrollment_summary(
+    summary_data = await enrollment_service.get_class_enrollment_summary(
         class_id, session_id, term_id, db
     )
     return summary_data
@@ -145,11 +130,11 @@ async def get_class_enrollment_summary(
 @router.post("/bulk-class-update", response_model=List[EnrollmentResponse])
 async def bulk_update_student_classes(
     update_data: BulkClassUpdateData,
-    db: Session = Depends(get_session)
+    db: AsyncSession = Depends(get_session)
 ):
-    successful_updates, failed_updates = enrollment_service.bulk_update_student_classes(update_data, db)
+    successful_updates, failed_updates = await enrollment_service.bulk_update_student_classes(update_data, db)
     
-    responses = [_build_enrollment_response(enr, db) for enr in successful_updates]
+    responses = await enrollment_service.build_enrollment_responses(successful_updates, db)
     
     if failed_updates:
         raise HTTPException(
@@ -159,7 +144,7 @@ async def bulk_update_student_classes(
                 "success_count": len(responses),
                 "error_count": len(failed_updates),
                 "errors": failed_updates,
-                "successful_updates": responses
+                "successful_updates": jsonable_encoder(responses)
             }
         )
     return responses

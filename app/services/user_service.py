@@ -10,9 +10,9 @@ import string
 from datetime import datetime, date
 from typing import List, Optional
 
-from sqlmodel import Session, select, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select, and_, or_
 from sqlalchemy import func, exists
-from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, UploadFile
 
 from app.models import User, UserRole, StudentProfile, StaffProfile, Enrollment, Class
@@ -38,27 +38,29 @@ def _parse_date(value: str | date) -> date:
 def _generate_random_numbers(length: int = 6) -> str:
     return ''.join(random.choices(string.digits, k=length))
 
-def _generate_student_username(session: Session) -> str:
+async def _generate_student_username(session: AsyncSession) -> str:
     for _ in range(100):
         username = f"CROWNERS{_generate_random_numbers(6)}"
-        if not session.exec(select(User).where(User.username == username)).first():
+        result = await session.execute(select(User).where(User.username == username))
+        if not result.scalars().first():
             return username
     raise HTTPException(status_code=500, detail="Could not generate a unique student username.")
 
-def _generate_staff_username(first_name: str, last_name: str, session: Session) -> str:
+async def _generate_staff_username(first_name: str, last_name: str, session: AsyncSession) -> str:
     first_clean = re.sub(r'[^a-zA-Z]', '', first_name).lower()
     last_clean = re.sub(r'[^a-zA-Z]', '', last_name).lower()
     base_username = f"{first_clean}.{last_clean}"
     
     username = base_username
     for i in range(100):
-        if not session.exec(select(User).where(User.username == username)).first():
+        result = await session.execute(select(User).where(User.username == username))
+        if not result.scalars().first():
             return username
         username = f"{base_username}{i+1}"
     raise HTTPException(status_code=500, detail="Could not generate a unique staff username.")
 
-def get_all_students(
-    db: Session,
+async def get_all_students(
+    db: AsyncSession,
     skip: int,
     limit: int,
     search: Optional[str],
@@ -70,9 +72,7 @@ def get_all_students(
     enrollment status, using an efficient subquery.
     """
     # Start with a base query for users who are students
-    query = select(User).options(
-        selectinload(User.student_profile) # Eager load profile
-    ).where(User.role == UserRole.student)
+    query = select(User).where(User.role == UserRole.student)
     
     conditions = []
     
@@ -110,122 +110,131 @@ def get_all_students(
 
     # Get total count based on the fully filtered query
     count_query = select(func.count()).select_from(query.subquery())
-    total_count = db.exec(count_query).one()
+    result = await db.execute(count_query)
+    total_count = result.scalar()
 
     # Apply pagination and ordering
-    paginated_query = query.order_by(User.last_name, User.first_name).offset(skip).limit(limit)
-    users = db.exec(paginated_query).all()
+    paginated_query = query.order_by(User.last_name, User.first_name, User.id).offset(skip).limit(limit)
+    result = await db.execute(paginated_query)
+    users = result.scalars().all()
     
     return users, total_count
 
-def _generate_admission_number(session: Session) -> str:
+async def _generate_admission_number(session: AsyncSession) -> str:
     """Generate unique admission number with format ADM + current year + random numbers"""
     current_year = datetime.now().year
     for _ in range(100):
         admission_number = f"ADM{current_year}{_generate_random_numbers(4)}"
-        if not session.exec(select(StudentProfile).where(StudentProfile.admission_number == admission_number)).first():
+        result = await session.execute(select(StudentProfile).where(StudentProfile.admission_number == admission_number))
+        if not result.scalars().first():
             return admission_number
     raise HTTPException(status_code=500, detail="Could not generate unique admission number.")
 
-def _generate_staff_number(session: Session) -> str:
+async def _generate_staff_number(session: AsyncSession) -> str:
     """Generate unique staff number with format STAFF + current year + random numbers"""
     current_year = datetime.now().year
     for _ in range(100):
         staff_number = f"STAFF{current_year}{_generate_random_numbers(4)}"
-        if not session.exec(select(StaffProfile).where(StaffProfile.staff_no == staff_number)).first():
+        result = await session.execute(select(StaffProfile).where(StaffProfile.staff_no == staff_number))
+        if not result.scalars().first():
             return staff_number
     raise HTTPException(status_code=500, detail="Could not generate unique staff number.")
 
 # --- CRITICAL: Preserving the exact response shape ---
-# This function is moved here unchanged to ensure the API contract is met.
-def build_user_response(user: User, session: Session) -> UserResponse:
+async def build_user_responses(users: List[User], session: AsyncSession) -> List[UserResponse]:
+    """
+    Build fully structured UserResponse objects for many users with a fixed
+    number of queries (instead of up to 3 per user).
+    """
+    if not users:
+        return []
+    student_ids = [u.id for u in users if u.role == UserRole.student]
+    staff_ids = [u.id for u in users if u.role == UserRole.staff]
+
+    enrolled_ids, student_profiles, class_names, staff_profiles = set(), {}, {}, {}
+    if student_ids:
+        enrolled_ids = set((await session.execute(
+            select(Enrollment.student_id).where(Enrollment.student_id.in_(student_ids), Enrollment.is_active == True)
+        )).scalars().all())
+        for profile in (await session.execute(select(StudentProfile).where(StudentProfile.user_id.in_(student_ids)))).scalars().all():
+            student_profiles.setdefault(profile.user_id, profile)
+        class_ids = {p.current_class_id for p in student_profiles.values() if p.current_class_id}
+        if class_ids:
+            class_names = dict((await session.execute(select(Class.id, Class.name).where(Class.id.in_(class_ids)))).all())
+    if staff_ids:
+        for profile in (await session.execute(select(StaffProfile).where(StaffProfile.user_id.in_(staff_ids)))).scalars().all():
+            staff_profiles.setdefault(profile.user_id, profile)
+
+    responses = []
+    for user in users:
+        user_dict = {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "phone": user.phone,
+            "role": user.role,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "middle_name": user.middle_name,
+            "gender": user.gender,
+            "date_of_birth": user.date_of_birth,
+            "is_active": user.is_active,
+            "profile_picture_url": user.profile_picture_url,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
+            "student_profile": None,
+            "staff_profile": None,
+            "enrolled": None,
+        }
+
+        if user.role == UserRole.student:
+            user_dict["enrolled"] = user.id in enrolled_ids
+            student_profile = student_profiles.get(user.id)
+            if student_profile:
+                user_dict["student_profile"] = {
+                    "admission_number": student_profile.admission_number,
+                    "guardian_name": student_profile.guardian_name,
+                    "guardian_phone": student_profile.guardian_phone,
+                    "guardian_email": student_profile.guardian_email,
+                    "current_class_id": student_profile.current_class_id,
+                    "current_class_name": class_names.get(student_profile.current_class_id),
+                    "enrollment_date": student_profile.enrollment_date,
+                    "address": student_profile.address,
+                    "blood_group": student_profile.blood_group,
+                    "allergies": student_profile.allergies,
+                    "medical_notes": student_profile.medical_notes,
+                    "status": student_profile.status,
+                }
+
+        elif user.role == UserRole.staff:
+            staff_profile = staff_profiles.get(user.id)
+            if staff_profile:
+                user_dict["staff_profile"] = {
+                    "staff_no": staff_profile.staff_no,
+                    "job_title": staff_profile.job_title,
+                    "employment_date": staff_profile.employment_date,
+                    "qualifications": staff_profile.qualifications,
+                    "address": staff_profile.address,
+                    "emergency_contact_name": staff_profile.emergency_contact_name,
+                    "emergency_contact_phone": staff_profile.emergency_contact_phone,
+                }
+
+        responses.append(UserResponse.model_validate(user_dict))
+    return responses
+
+
+async def build_user_response(user: User, session: AsyncSession) -> UserResponse:
     """Build and return a fully structured UserResponse with all relationships."""
-
-    user_dict = {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "phone": user.phone,
-        "role": user.role,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "middle_name": user.middle_name,
-        "gender": user.gender,
-        "date_of_birth": user.date_of_birth,
-        "is_active": user.is_active,
-        "profile_picture_url": user.profile_picture_url,
-        "created_at": user.created_at,
-        "updated_at": user.updated_at,
-        "student_profile": None,
-        "staff_profile": None,
-        "enrolled": None,
-    }
-
-    if user.role == UserRole.student:
-        # Check active enrollment
-        active_enrollment = session.exec(
-            select(Enrollment).where(
-                and_(
-                    Enrollment.student_id == user.id,
-                    Enrollment.is_active == True
-                )
-            )
-        ).first()
-        user_dict["enrolled"] = bool(active_enrollment)
-
-        # Load student profile
-        student_profile = session.exec(
-            select(StudentProfile).where(StudentProfile.user_id == user.id)
-        ).first()
-
-        if student_profile:
-            class_name = None
-            if student_profile.current_class_id:
-                class_obj = session.get(Class, student_profile.current_class_id)
-                class_name = class_obj.name if class_obj else None
-
-            user_dict["student_profile"] = {
-                "admission_number": student_profile.admission_number,
-                "guardian_name": student_profile.guardian_name,
-                "guardian_phone": student_profile.guardian_phone,
-                "guardian_email": student_profile.guardian_email,
-                "current_class_id": student_profile.current_class_id,
-                "current_class_name": class_name,
-                "enrollment_date": student_profile.enrollment_date,
-                "address": student_profile.address,
-                "blood_group": student_profile.blood_group,
-                "allergies": student_profile.allergies,
-                "medical_notes": student_profile.medical_notes,
-                "status": student_profile.status,
-            }
-
-    elif user.role == UserRole.staff:
-        # Load staff profile
-        staff_profile = session.exec(
-            select(StaffProfile).where(StaffProfile.user_id == user.id)
-        ).first()
-
-        if staff_profile:
-            user_dict["staff_profile"] = {
-                "staff_no": staff_profile.staff_no,
-                "job_title": staff_profile.job_title,
-                "employment_date": staff_profile.employment_date,
-                "qualifications": staff_profile.qualifications,
-                "address": staff_profile.address,
-                "emergency_contact_name": staff_profile.emergency_contact_name,
-                "emergency_contact_phone": staff_profile.emergency_contact_phone,
-            }
-
-    return UserResponse.model_validate(user_dict)
+    return (await build_user_responses([user], session))[0]
 
 
 # --- Service Functions wrapping the business logic ---
 
-def get_user_by_id(user_id: str, session: Session) -> User | None:
-    return session.get(User, user_id)
+async def get_user_by_id(user_id: str, session: AsyncSession) -> User | None:
+    return await session.get(User, user_id)
 
-def get_all_users(
-    session: Session,
+async def get_all_users(
+    session: AsyncSession,
     skip: int,
     limit: int,
     role: UserRole | None = None,
@@ -233,16 +242,10 @@ def get_all_users(
     search: str | None = None,
 ):
     """Fetch a filtered, paginated list of users."""
-    query = (
-        select(User)
-        .options(
-            selectinload(User.student_profile),
-            selectinload(User.staff_profile)
-        )
-    )
+    query = select(User)
 
     conditions = []
-    if role:
+    if role is not None:
         conditions.append(User.role == role)
     if is_active is not None:
         conditions.append(User.is_active == is_active)
@@ -260,30 +263,33 @@ def get_all_users(
     if conditions:
         query = query.where(and_(*conditions))
 
-    total_count = session.exec(
+    result = await session.execute(
         select(func.count()).select_from(query.subquery())
-    ).one()
+    )
+    total_count = result.scalar()
 
-    users = session.exec(query.offset(skip).limit(limit)).all()
+    result = await session.execute(query.order_by(User.created_at, User.id).offset(skip).limit(limit))
+    users = result.scalars().all()
 
     return users, total_count
 
-def create_user_with_profile(user_data: UserCreate, session: Session) -> User:
+async def create_user_with_profile(user_data: UserCreate, session: AsyncSession) -> User:
     """
     Creates a new user and their corresponding profile in a single transaction.
     Logic is identical to the original create_user_with_profile endpoint.
     """
-    if session.exec(select(User).where(or_(User.email == user_data.email, User.phone == user_data.phone))).first():
+    result = await session.execute(select(User).where(or_(User.email == user_data.email, User.phone == user_data.phone)))
+    if result.scalars().first():
         raise HTTPException(status_code=400, detail="Email or phone number already exists")
 
-    username = (_generate_student_username(session) if user_data.role == UserRole.student
-                else _generate_staff_username(user_data.first_name, user_data.last_name, session))
+    username = (await _generate_student_username(session) if user_data.role == UserRole.student
+                else await _generate_staff_username(user_data.first_name, user_data.last_name, session))
 
     new_user = User(
         username=username,
         email=user_data.email,
         phone=user_data.phone,
-        password_hash=get_password_hash(user_data.password),
+        password_hash= await get_password_hash(user_data.password),
         role=user_data.role,
         first_name=user_data.first_name,
         last_name=user_data.last_name,
@@ -292,7 +298,7 @@ def create_user_with_profile(user_data: UserCreate, session: Session) -> User:
         date_of_birth=_parse_date(user_data.date_of_birth),
     )
     session.add(new_user)
-    session.flush()  # Assigns an ID to new_user before commit
+    await session.flush()  # Assigns an ID to new_user before commit
 
     if user_data.role == UserRole.student:
         if not user_data.student_profile_data:
@@ -300,7 +306,7 @@ def create_user_with_profile(user_data: UserCreate, session: Session) -> User:
         
         student_profile = StudentProfile(
             user_id=new_user.id,
-            admission_number=_generate_admission_number(session),
+            admission_number=await _generate_admission_number(session),
             **user_data.student_profile_data.model_dump()
         )
         session.add(student_profile)
@@ -311,20 +317,20 @@ def create_user_with_profile(user_data: UserCreate, session: Session) -> User:
         
         staff_profile = StaffProfile(
             user_id=new_user.id,
-            staff_no=_generate_staff_number(session),
+            staff_no=await _generate_staff_number(session),
             **user_data.staff_profile_data.model_dump()
         )
         session.add(staff_profile)
 
-    session.commit()
-    session.refresh(new_user)
+    await session.commit()
+    await session.refresh(new_user)
     return new_user
-def update_user(user_id: str, user_data: UserUpdate, session: Session) -> User:
+async def update_user(user_id: str, user_data: UserUpdate, session: AsyncSession) -> User:
     """
     Updates a user's details.
     Logic is identical to the original update_user endpoint.
     """
-    user_to_update = get_user_by_id(user_id, session)
+    user_to_update = await get_user_by_id(user_id, session)
     if not user_to_update:
         return None # Let the route handle the 404
 
@@ -334,7 +340,8 @@ def update_user(user_id: str, user_data: UserUpdate, session: Session) -> User:
         if user_data.email: conditions.append(User.email == user_data.email)
         if user_data.phone: conditions.append(User.phone == user_data.phone)
         
-        existing_user = session.exec(select(User).where(and_(User.id != user_id, or_(*conditions)))).first()
+        result = await session.execute(select(User).where(and_(User.id != user_id, or_(*conditions))))
+        existing_user = result.scalars().first()
         if existing_user:
             raise HTTPException(status_code=400, detail="Email or phone already exists")
 
@@ -348,42 +355,43 @@ def update_user(user_id: str, user_data: UserUpdate, session: Session) -> User:
     user_to_update.updated_at = datetime.utcnow()
     
     session.add(user_to_update)
-    session.commit()
-    session.refresh(user_to_update)
+    await session.commit()
+    await session.refresh(user_to_update)
     return user_to_update
 
-def set_user_active_status(user_id: str, is_active: bool, session: Session) -> User:
+async def set_user_active_status(user_id: str, is_active: bool, session: AsyncSession) -> User:
     """
     Sets a user's active status (deactivate or reactivate).
     """
-    user = get_user_by_id(user_id, session)
+    user = await get_user_by_id(user_id, session)
     if not user:
         return None
 
     user.is_active = is_active
     user.updated_at = datetime.utcnow()
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
     return user
 
-def reset_user_password(user_id: str, new_password: str, session: Session) -> User:
+async def reset_user_password(user_id: str, new_password: str, session: AsyncSession) -> User:
     """
     Resets a user's password (admin action).
     """
-    user = get_user_by_id(user_id, session)
+    user = await get_user_by_id(user_id, session)
     if not user:
         return None
 
-    user.password_hash = get_password_hash(new_password)
+    user.password_hash =await get_password_hash(new_password)
     user.updated_at = datetime.utcnow()
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
     return user
-def update_student_profile(user_id: str, profile_data: StudentProfileUpdate, session: Session) -> StudentProfile:
+async def update_student_profile(user_id: str, profile_data: StudentProfileUpdate, session: AsyncSession) -> StudentProfile:
     """Updates a student's profile."""
-    profile = session.exec(select(StudentProfile).where(StudentProfile.user_id == user_id)).first()
+    result = await session.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
+    profile = result.scalars().first()
     if not profile:
         return None
 
@@ -392,14 +400,15 @@ def update_student_profile(user_id: str, profile_data: StudentProfileUpdate, ses
         setattr(profile, key, value)
     
     session.add(profile)
-    session.commit()
-    session.refresh(profile)
+    await session.commit()
+    await session.refresh(profile)
     return profile
 
 
-def update_staff_profile(user_id: str, profile_data: StaffProfileUpdate, session: Session) -> StaffProfile:
+async def update_staff_profile(user_id: str, profile_data: StaffProfileUpdate, session: AsyncSession) -> StaffProfile:
     """Updates a staff member's profile."""
-    profile = session.exec(select(StaffProfile).where(StaffProfile.user_id == user_id)).first()
+    result = await session.execute(select(StaffProfile).where(StaffProfile.user_id == user_id))
+    profile = result.scalars().first()
     if not profile:
         return None
 
@@ -408,14 +417,14 @@ def update_staff_profile(user_id: str, profile_data: StaffProfileUpdate, session
         setattr(profile, key, value)
     
     session.add(profile)
-    session.commit()
-    session.refresh(profile)
+    await session.commit()
+    await session.refresh(profile)
     return profile
 
 
-async def update_user_profile_picture(user_id: str, file: UploadFile, session: Session) -> User:
+async def update_user_profile_picture(user_id: str, file: UploadFile, session: AsyncSession) -> User:
     """Handles profile picture upload and updates the user record."""
-    user = get_user_by_id(user_id, session)
+    user = await get_user_by_id(user_id, session)
     if not user:
         return None
 
@@ -430,14 +439,14 @@ async def update_user_profile_picture(user_id: str, file: UploadFile, session: S
     # Save the new URL to the user record
     user.profile_picture_url = image_url
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
     return user
 
 
-async def delete_user_profile_picture(user_id: str, session: Session) -> User:
+async def delete_user_profile_picture(user_id: str, session: AsyncSession) -> User:
     """Handles profile picture deletion."""
-    user = get_user_by_id(user_id, session)
+    user = await get_user_by_id(user_id, session)
     if not user or not user.profile_picture_url:
         return None # Let the route handle the 404/400
         
@@ -445,7 +454,7 @@ async def delete_user_profile_picture(user_id: str, session: Session) -> User:
     
     user.profile_picture_url = None
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    await session.commit()
+    await session.refresh(user)
     return user
 # ... More service functions for create, update, delete will be added here as we refactor more endpoints

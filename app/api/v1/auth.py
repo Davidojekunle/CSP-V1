@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlmodel import Session, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 from datetime import datetime, timedelta
 import secrets
 
@@ -10,7 +11,7 @@ from app.core.auth import (
     create_access_token,
     get_current_active_user
 )
-from app.core.security import get_password_hash
+from app.core.security import get_password_hash, verify_password
 from app.core.config import settings
 from app.models import User
 from app.schemas.auth import (
@@ -29,13 +30,13 @@ router = APIRouter()
 @router.post("/token", response_model=TokenResponse)
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ):
     """
     Login endpoint to get access token.
     PRESERVED: Exact same logic and response structure.
     """
-    user = authenticate_user(form_data.username, form_data.password, session)
+    user = await authenticate_user(form_data.username, form_data.password, session)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -82,13 +83,14 @@ async def get_current_user_profile(
 async def forgot_password(
     request: ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ):
     """
     Send password reset email.
     PRESERVED: Exact same logic.
     """
-    user = session.exec(select(User).where(User.email == request.email)).first()
+    result = await session.execute(select(User).where(User.email == request.email))
+    user = result.scalars().first()
     if not user:
         return MessageResponse(message="If the email exists, a reset link will be sent")
     
@@ -99,7 +101,7 @@ async def forgot_password(
     user.reset_password_token = reset_token
     user.reset_password_expires = datetime.utcnow() + timedelta(hours=2)
     session.add(user)
-    session.commit()
+    await session.commit()
     
     background_tasks.add_task(
         send_password_reset_email,
@@ -114,29 +116,30 @@ async def forgot_password(
 @router.post("/reset-password", response_model=MessageResponse)
 async def reset_password(
     request: ResetPasswordRequest,
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ):
     """
     Reset password using token.
     PRESERVED: Exact same logic.
     """
-    user = session.exec(
+    result = await session.execute(
         select(User).where(
             User.reset_password_token == request.token,
             User.reset_password_expires > datetime.utcnow()
         )
-    ).first()
+    )
+    user = result.scalars().first()
 
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
     
     # Update password
-    user.password_hash = get_password_hash(request.new_password)
+    user.password_hash = await get_password_hash(request.new_password)
     user.reset_password_token = None
     user.reset_password_expires = None
     user.updated_at = datetime.utcnow()
     session.add(user)
-    session.commit()
+    await session.commit()
     
     return MessageResponse(message="Password reset successfully")
 
@@ -145,26 +148,24 @@ async def reset_password(
 async def change_password(
     request: ChangePasswordRequest,
     current_user: dict = Depends(get_current_active_user),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_session)
 ):
     """
     Change user password.
     PRESERVED: Exact same logic.
     """
-    from app.core.security import verify_password
-    
     user = current_user["user"]
-    
+
     # Verify old password
-    if not verify_password(request.old_password, user.password_hash):
+    if not await verify_password(request.old_password, user.password_hash):
         raise HTTPException(status_code=400, detail="Incorrect old password")
     
     # Update password
-    user.password_hash = get_password_hash(request.new_password)
+    user.password_hash = await get_password_hash(request.new_password)
     user.updated_at = datetime.utcnow()
     
     session.add(user)
-    session.commit()
+    await session.commit()
     
     return MessageResponse(message="Password changed successfully")
 

@@ -2,7 +2,8 @@
 """
 Service layer for managing academic structures (sessions, terms, classes, subjects).
 """
-from sqlmodel import Session, select, func, and_
+from sqlmodel import select, func, and_
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from typing import List, Optional
 from datetime import datetime, date
@@ -29,8 +30,8 @@ def _validate_date_range(start_date: date, end_date: date):
 
 # --- Service Functions for Academic Sessions ---
 
-def create_academic_session(session_data: AcademicSessionCreate, db: Session) -> AcademicSession:
-    if db.exec(select(AcademicSession).where(AcademicSession.name == session_data.name)).first():
+async def create_academic_session(session_data: AcademicSessionCreate, db: AsyncSession) -> AcademicSession:
+    if (await db.execute(select(AcademicSession).where(AcademicSession.name == session_data.name))).scalars().first():
         raise HTTPException(status_code=400, detail="Academic session name already exists")
     
     start_date = _parse_date(session_data.start_date)
@@ -39,7 +40,7 @@ def create_academic_session(session_data: AcademicSessionCreate, db: Session) ->
     
     if session_data.is_current:
         # Unset other current sessions
-        current_sessions = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).all()
+        current_sessions = (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))).scalars().all()
         for s in current_sessions:
             s.is_current = False
             db.add(s)
@@ -51,32 +52,32 @@ def create_academic_session(session_data: AcademicSessionCreate, db: Session) ->
         is_current=session_data.is_current
     )
     db.add(new_session)
-    db.commit()
-    db.refresh(new_session)
+    await db.commit()
+    await db.refresh(new_session)
     return new_session
 
-def get_all_academic_sessions(db: Session) -> List[dict]:
+async def get_all_academic_sessions(db: AsyncSession) -> List[dict]:
     """
     PERFORMANCE: This fetches sessions and counts terms efficiently.
     """
-    sessions_db = db.exec(select(AcademicSession).order_by(AcademicSession.start_date.desc())).all()
+    sessions_db = (await db.execute(select(AcademicSession).order_by(AcademicSession.start_date.desc()))).scalars().all()
+    terms_counts = dict((await db.execute(select(Term.session_id, func.count(Term.id)).group_by(Term.session_id))).all())
     response = []
     for s in sessions_db:
-        terms_count = db.exec(select(func.count(Term.id)).where(Term.session_id == s.id)).one()
         response.append({
             "id": s.id, "name": s.name, "is_current": s.is_current,
             "start_date": str(s.start_date), "end_date": str(s.end_date),
-            "terms_count": terms_count
+            "terms_count": terms_counts.get(s.id, 0)
         })
     return response
 
 # --- Service Functions for Terms ---
 
-def create_term(term_data: TermCreate, db: Session) -> tuple[Term, AcademicSession]:
-    academic_session = db.get(AcademicSession, term_data.session_id)
+async def create_term(term_data: TermCreate, db: AsyncSession) -> tuple[Term, AcademicSession]:
+    academic_session = await db.get(AcademicSession, term_data.session_id)
     if not academic_session:
         raise HTTPException(status_code=404, detail="Academic session not found")
-    if db.exec(select(Term).where(and_(Term.session_id == term_data.session_id, Term.name == term_data.name))).first():
+    if (await db.execute(select(Term).where(and_(Term.session_id == term_data.session_id, Term.name == term_data.name)))).scalars().first():
         raise HTTPException(status_code=400, detail="Term already exists in this session")
 
     start_date = _parse_date(term_data.start_date)
@@ -88,7 +89,7 @@ def create_term(term_data: TermCreate, db: Session) -> tuple[Term, AcademicSessi
     if term_data.is_current:
         if not academic_session.is_current:
              raise HTTPException(status_code=400, detail="Cannot set term as current because its session is not current.")
-        current_terms = db.exec(select(Term).where(Term.is_current == True)).all()
+        current_terms = (await db.execute(select(Term).where(Term.is_current == True))).scalars().all()
         for t in current_terms:
             t.is_current = False
             db.add(t)
@@ -98,18 +99,18 @@ def create_term(term_data: TermCreate, db: Session) -> tuple[Term, AcademicSessi
         start_date=start_date, end_date=end_date, is_current=term_data.is_current
     )
     db.add(new_term)
-    db.commit()
-    db.refresh(new_term)
+    await db.commit()
+    await db.refresh(new_term)
     return new_term, academic_session
 
 
 # --- Service Functions for Classes ---
 
-def get_all_classes(db: Session, is_active: Optional[bool]) -> List[dict]:
+async def get_all_classes(db: AsyncSession, is_active: Optional[bool]) -> List[dict]:
     """
     PERFORMANCE: Uses subqueries and a single main query to avoid N+1.
     """
-    current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+    current_session = (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))).scalars().first()
     if not current_session:
         raise HTTPException(status_code=404, detail="No active academic session found")
 
@@ -132,7 +133,7 @@ def get_all_classes(db: Session, is_active: Optional[bool]) -> List[dict]:
     if is_active is not None:
         query = query.where(Class.is_active == is_active)
 
-    results = db.exec(query.order_by(Class.level, Class.arm)).all()
+    results = (await db.execute(query.order_by(Class.level, Class.arm))).all()
     
     # Process results into the required dictionary shape for the response model
     response_data = []
@@ -146,19 +147,19 @@ def get_all_classes(db: Session, is_active: Optional[bool]) -> List[dict]:
         })
     return response_data
 
-def get_students_in_class(class_id: str, session_id: Optional[str], db: Session) -> List[dict]:
+async def get_students_in_class(class_id: str, session_id: Optional[str], db: AsyncSession) -> List[dict]:
     """Gets all students enrolled in a specific class for a given session."""
-    if not db.get(Class, class_id):
+    if not await db.get(Class, class_id):
         raise HTTPException(status_code=404, detail="Class not found")
 
     target_session_id = session_id
     if not target_session_id:
-        current_session = db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).first()
+        current_session = (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))).scalars().first()
         if not current_session:
             raise HTTPException(status_code=400, detail="No active academic session found and no session_id provided")
         target_session_id = current_session.id
     
-    academic_session = db.get(AcademicSession, target_session_id)
+    academic_session = await db.get(AcademicSession, target_session_id)
     if not academic_session:
         raise HTTPException(status_code=404, detail="Academic session not found")
 
@@ -173,7 +174,7 @@ def get_students_in_class(class_id: str, session_id: Optional[str], db: Session)
         Enrollment.session_id == target_session_id
     ).order_by(User.last_name, User.first_name)
     
-    results = db.exec(query).all()
+    results = (await db.execute(query)).all()
     
     # PRESERVE RESPONSE SHAPE: Build the list of dictionaries exactly as the original endpoint did
     student_list = []
@@ -198,18 +199,18 @@ def get_students_in_class(class_id: str, session_id: Optional[str], db: Session)
 
 # --- Service Functions for Updating Sessions and Terms ---
 
-def update_academic_session(session_id: str, update_data: AcademicSessionUpdate, db: Session) -> AcademicSession:
-    academic_session = db.get(AcademicSession, session_id)
+async def update_academic_session(session_id: str, update_data: AcademicSessionUpdate, db: AsyncSession) -> AcademicSession:
+    academic_session = await db.get(AcademicSession, session_id)
     if not academic_session:
         raise HTTPException(status_code=404, detail="Academic session not found")
 
     update_dict = update_data.model_dump(exclude_unset=True)
     if "name" in update_dict and update_dict["name"] != academic_session.name:
-        if db.exec(select(AcademicSession).where(AcademicSession.name == update_dict["name"], AcademicSession.id != session_id)).first():
+        if (await db.execute(select(AcademicSession).where(AcademicSession.name == update_dict["name"], AcademicSession.id != session_id))).scalars().first():
             raise HTTPException(status_code=400, detail="Academic session name already exists")
     
     if update_dict.get("is_current"):
-        current_sessions = db.exec(select(AcademicSession).where(AcademicSession.is_current == True, AcademicSession.id != session_id)).all()
+        current_sessions = (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True, AcademicSession.id != session_id))).scalars().all()
         for s in current_sessions:
             s.is_current = False
             db.add(s)
@@ -223,26 +224,26 @@ def update_academic_session(session_id: str, update_data: AcademicSessionUpdate,
     _validate_date_range(academic_session.start_date, academic_session.end_date)
     
     db.add(academic_session)
-    db.commit()
-    db.refresh(academic_session)
+    await db.commit()
+    await db.refresh(academic_session)
     return academic_session
 
-def set_current_term_and_session(term_id: str, db: Session) -> tuple[Term, AcademicSession]:
-    target_term = db.get(Term, term_id)
+async def set_current_term_and_session(term_id: str, db: AsyncSession) -> tuple[Term, AcademicSession]:
+    target_term = await db.get(Term, term_id)
     if not target_term:
         raise HTTPException(status_code=404, detail="Term not found")
 
-    parent_session = db.get(AcademicSession, target_term.session_id)
+    parent_session = await db.get(AcademicSession, target_term.session_id)
     if not parent_session:
         raise HTTPException(status_code=500, detail="Term's parent academic session not found")
 
     # Unset all other current terms
-    for term in db.exec(select(Term).where(Term.is_current == True)).all():
+    for term in (await db.execute(select(Term).where(Term.is_current == True))).scalars().all():
         term.is_current = False
         db.add(term)
     
     # Unset all other current sessions
-    for ac_session in db.exec(select(AcademicSession).where(AcademicSession.is_current == True)).all():
+    for ac_session in (await db.execute(select(AcademicSession).where(AcademicSession.is_current == True))).scalars().all():
         ac_session.is_current = False
         db.add(ac_session)
 
@@ -251,14 +252,14 @@ def set_current_term_and_session(term_id: str, db: Session) -> tuple[Term, Acade
     parent_session.is_current = True
     db.add(target_term)
     db.add(parent_session)
-    db.commit()
+    await db.commit()
     return target_term, parent_session
 
-def get_all_terms(db: Session, session_id: Optional[str]) -> List[dict]:
+async def get_all_terms(db: AsyncSession, session_id: Optional[str]) -> List[dict]:
     query = select(Term, AcademicSession).join(AcademicSession)
     if session_id:
         query = query.where(Term.session_id == session_id)
-    results = db.exec(query.order_by(AcademicSession.start_date.desc(), Term.start_date.asc())).all()
+    results = (await db.execute(query.order_by(AcademicSession.start_date.desc(), Term.start_date.asc()))).all()
     
     return [
         {
@@ -269,72 +270,74 @@ def get_all_terms(db: Session, session_id: Optional[str]) -> List[dict]:
     ]
 
 # --- ADD/COMPLETE Service Functions for Classes ---
-def create_class(class_data: ClassCreate, db: Session) -> tuple[Class, Optional[User]]:
-    if db.exec(select(Class).where(Class.name == class_data.name)).first():
+async def create_class(class_data: ClassCreate, db: AsyncSession) -> tuple[Class, Optional[User]]:
+    if (await db.execute(select(Class).where(Class.name == class_data.name))).scalars().first():
         raise HTTPException(status_code=400, detail="Class name already exists")
     
     teacher = None
     if class_data.form_teacher_id:
-        teacher = db.get(User, class_data.form_teacher_id)
+        teacher = await db.get(User, class_data.form_teacher_id)
         if not teacher or teacher.role not in [UserRole.staff, UserRole.admin]:
             raise HTTPException(status_code=404, detail="Valid form teacher not found")
 
     new_class = Class.model_validate(class_data)
     db.add(new_class)
-    db.commit()
-    db.refresh(new_class)
+    await db.commit()
+    await db.refresh(new_class)
     return new_class, teacher
 
 
 # --- ADD/COMPLETE Service Functions for Subjects ---
-def get_all_subjects(db: Session, is_active: Optional[bool]) -> List[dict]:
+async def get_all_subjects(db: AsyncSession, is_active: Optional[bool]) -> List[dict]:
     query = select(Subject)
     if is_active is not None:
         query = query.where(Subject.is_active == is_active)
-    subjects = db.exec(query.order_by(Subject.name)).all()
+    subjects = (await db.execute(query.order_by(Subject.name))).scalars().all()
     
+    classes_counts = dict((await db.execute(
+        select(ClassSubject.subject_id, func.count(ClassSubject.id)).group_by(ClassSubject.subject_id)
+    )).all())
     response = []
     for subject in subjects:
-        classes_count = db.exec(select(func.count(ClassSubject.id)).where(ClassSubject.subject_id == subject.id)).one()
         response.append({
             "id": subject.id, "code": subject.code, "name": subject.name,
-            "is_active": subject.is_active, "classes_count": classes_count
+            "is_active": subject.is_active, "classes_count": classes_counts.get(subject.id, 0)
         })
     return response
 
 
 # --- Service Functions for Subjects ---
 
-def create_subject(subject_data: SubjectCreate, db: Session) -> Subject:
-    if db.exec(select(Subject).where(Subject.code == subject_data.code.upper())).first():
+async def create_subject(subject_data: SubjectCreate, db: AsyncSession) -> Subject:
+    if (await db.execute(select(Subject).where(Subject.code == subject_data.code.upper()))).scalars().first():
         raise HTTPException(status_code=400, detail="Subject code already exists")
     
     new_subject = Subject(code=subject_data.code.upper(), name=subject_data.name)
     db.add(new_subject)
-    db.commit()
-    db.refresh(new_subject)
+    await db.commit()
+    await db.refresh(new_subject)
     return new_subject
 
 # --- Service Functions for Class-Subject Assignments ---
 
-def assign_subject_to_class(assign_data: ClassSubjectAssign, db: Session) -> dict:
-    class_obj = db.get(Class, assign_data.class_id)
+async def assign_subject_to_class(assign_data: ClassSubjectAssign, db: AsyncSession) -> dict:
+    class_obj = await db.get(Class, assign_data.class_id)
     if not class_obj: raise HTTPException(status_code=404, detail="Class not found")
     
-    subject = db.get(Subject, assign_data.subject_id)
+    subject = await db.get(Subject, assign_data.subject_id)
     if not subject: raise HTTPException(status_code=404, detail="Subject not found")
 
-    teacher = db.get(User, assign_data.teacher_id)
+    teacher = await db.get(User, assign_data.teacher_id)
     if not teacher or teacher.role not in [UserRole.staff, UserRole.admin]:
         raise HTTPException(status_code=404, detail="Valid teacher not found")
 
-    if db.exec(select(ClassSubject).where(and_(ClassSubject.class_id == assign_data.class_id, ClassSubject.subject_id == assign_data.subject_id))).first():
+    if (await db.execute(select(ClassSubject).where(and_(ClassSubject.class_id == assign_data.class_id, ClassSubject.subject_id == assign_data.subject_id)))).scalars().first():
         raise HTTPException(status_code=400, detail="Subject already assigned to this class")
 
     new_assignment = ClassSubject(**assign_data.model_dump())
     db.add(new_assignment)
-    db.commit()
-    db.refresh(new_assignment)
+    await db.commit()
+    await db.refresh(new_assignment)
 
     return {
         "assignment": new_assignment,
@@ -343,14 +346,14 @@ def assign_subject_to_class(assign_data: ClassSubjectAssign, db: Session) -> dic
         "teacher": teacher
     }
 
-def delete_class_subject_assignment(assignment_id: str, db: Session):
-    assignment = db.get(ClassSubject, assignment_id)
+async def delete_class_subject_assignment(assignment_id: str, db: AsyncSession):
+    assignment = await db.get(ClassSubject, assignment_id)
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
-    db.delete(assignment)
-    db.commit()
+    await db.delete(assignment)
+    await db.commit()
 
-def get_all_class_subject_assignments(db: Session, class_id: Optional[str], subject_id: Optional[str], teacher_id: Optional[str]) -> List[dict]:
+async def get_all_class_subject_assignments(db: AsyncSession, class_id: Optional[str], subject_id: Optional[str], teacher_id: Optional[str]) -> List[dict]:
     query = select(ClassSubject, Class, Subject, User).join(
         Class, ClassSubject.class_id == Class.id
     ).join(
@@ -361,8 +364,8 @@ def get_all_class_subject_assignments(db: Session, class_id: Optional[str], subj
     if class_id: query = query.where(ClassSubject.class_id == class_id)
     if subject_id: query = query.where(ClassSubject.subject_id == subject_id)
     if teacher_id: query = query.where(ClassSubject.teacher_id == teacher_id)
-    
-    results = db.exec(query).all()
+
+    results = (await db.execute(query.order_by(Class.name, Subject.name))).all()
     
     return [
         {
